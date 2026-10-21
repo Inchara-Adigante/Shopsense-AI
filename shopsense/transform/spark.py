@@ -4,11 +4,15 @@ Locally this runs Spark in-process (local[*]). On AWS the same transformation
 code runs as a Glue job, where Glue provides the session instead.
 """
 import os
+import sys
 
 from pyspark.sql import SparkSession
 
 
 def get_spark(app_name: str = "shopsense") -> SparkSession:
+    # Python workers must use the same interpreter (and venv) as the driver.
+    os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
+    os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
     return (
         SparkSession.builder
         .master(os.getenv("SPARK_MASTER", "local[*]"))
