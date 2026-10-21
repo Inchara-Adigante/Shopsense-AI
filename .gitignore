@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Secrets
+.env
+
+# Generated data - rebuilt by the pipeline, never committed
+data/
+lake/
+warehouse/*.duckdb
+warehouse/*.duckdb.wal
+spark-warehouse/
+metastore_db/
+derby.log
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
