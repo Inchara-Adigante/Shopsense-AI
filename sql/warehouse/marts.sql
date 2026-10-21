@@ -79,7 +79,7 @@ SELECT CAST(as_of AS DATE)                                             AS as_of_
        s.on_hand_units, s.inbound_units, s.units_28d, s.stockout_days_28d,
        ROUND(s.daily_demand, 2)                                        AS daily_demand,
        ROUND(s.on_hand_units / NULLIF(s.daily_demand, 0), 1)           AS days_of_cover,
-       CAST(as_of AS DATE) + CAST(FLOOR(s.on_hand_units / NULLIF(s.daily_demand, 0)) AS INTEGER)
+       CAST(CAST(as_of AS DATE) + CAST(FLOOR(s.on_hand_units / NULLIF(s.daily_demand, 0)) AS INTEGER) AS DATE)
                                                                        AS projected_stockout_date,
        CASE WHEN s.on_hand_units = 0                                   THEN 'Out of stock'
             WHEN s.on_hand_units / NULLIF(s.daily_demand, 0) < 7       THEN 'High'
