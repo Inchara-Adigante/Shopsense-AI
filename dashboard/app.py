@@ -37,12 +37,15 @@ st.caption(f"Data as of **{pd.Timestamp(as_of):%b %d, %Y}** · Which products wi
            "what is driving demand, and what should we do?")
 
 # ---------------------------------------------------------------- KPIs
+# Orders are counted from the fact table: summing mart.daily_sales.orders would double-count
+# orders that contain items from more than one category.
 kpi = query("""
-    WITH s AS (SELECT * FROM mart.daily_sales), l AS (SELECT MAX(date) d FROM s)
-    SELECT SUM(net_revenue) FILTER (WHERE date >  l.d - INTERVAL 28 DAY) AS rev_28,
-           SUM(net_revenue) FILTER (WHERE date <= l.d - INTERVAL 28 DAY AND date > l.d - INTERVAL 56 DAY) AS rev_prev,
-           SUM(orders)      FILTER (WHERE date >  l.d - INTERVAL 28 DAY) AS orders_28
-    FROM s, l""").iloc[0]
+    WITH f AS (SELECT d.date, f.order_id, f.net_amount FROM dw.fact_order_item f JOIN dw.dim_date d USING (date_key)),
+         l AS (SELECT MAX(date) d FROM f)
+    SELECT SUM(net_amount) FILTER (WHERE date >  l.d - INTERVAL 28 DAY) AS rev_28,
+           SUM(net_amount) FILTER (WHERE date <= l.d - INTERVAL 28 DAY AND date > l.d - INTERVAL 56 DAY) AS rev_prev,
+           COUNT(DISTINCT order_id) FILTER (WHERE date > l.d - INTERVAL 28 DAY) AS orders_28
+    FROM f, l""").iloc[0]
 conv = query("""
     SELECT SUM(converted_sessions) / SUM(sessions) AS conv FROM mart.daily_funnel
     WHERE date > (SELECT MAX(date) FROM mart.daily_funnel) - INTERVAL 28 DAY""")["conv"].iloc[0]

@@ -10,6 +10,8 @@
 --     was out of stock for 14 of 28 days really sells twice as fast as its raw average.
 
 -- ---------------------------------------------------------------- sales
+-- Grain: date x category. "orders" counts orders containing that category, so do not
+-- sum it across categories (an order with two categories would be counted twice).
 CREATE OR REPLACE VIEW mart.daily_sales AS
 SELECT d.date, p.category,
        COUNT(DISTINCT f.order_id)              AS orders,
