@@ -3,6 +3,6 @@ pyspark==4.2.0          # needs Java 17 or 21
 duckdb==2.0.0           # local columnar warehouse (stand-in for Amazon Redshift)
 pandas>=2.2,<3          # PySpark does not fully support pandas 3 yet
 pyarrow==26.0.0
-numpy==2.5.4
+numpy==2.3.5
 streamlit==1.66.1
 pytest==9.1.1
