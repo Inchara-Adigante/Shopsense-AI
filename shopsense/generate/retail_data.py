@@ -442,6 +442,14 @@ def generate(n_days: int = N_DAYS, seed: int = SEED, landing: Path | None = None
             src = {"inventory_snapshots": tables["inventory"], "clickstream": on_time}.get(k, dirty.get(k))
             counts[k] = counts.get(k, 0) + len(src)
 
+    # Events still in flight at the end of the simulation arrive the next day.
+    if late is not None and len(late):
+        out = landing / "clickstream" / (START_DATE + pd.Timedelta(days=n_days)).strftime("%Y-%m-%d") / "events.json.gz"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with gzip.open(out, "wt") as fh:
+            late.to_json(fh, orient="records", lines=True)
+        counts["clickstream"] += len(late)
+
     # Reviews, delivered on the day they were posted.
     end = START_DATE + pd.Timedelta(days=n_days) - pd.Timedelta(seconds=1)
     reviews = sim.make_reviews(pd.concat(all_items), pd.concat(all_orders), end)
