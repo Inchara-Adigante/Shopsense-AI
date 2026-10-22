@@ -6,3 +6,4 @@ pyarrow==26.0.0
 numpy==2.3.5
 streamlit==1.66.1
 pytest==9.1.1
+anthropic==2.1.0         # Claude API (assistant + review summaries; optional - offline mode needs no key)
