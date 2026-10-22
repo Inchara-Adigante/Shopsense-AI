@@ -31,7 +31,7 @@ def pipeline(tmp_path_factory, spark):
     landing, lake, db = root / "landing", root / "lake", root / "warehouse.duckdb"
     counts = generate(n_days=N_DAYS, seed=7, landing=landing)
     ingest(landing=landing, lake=lake)
-    clean_stats = clean.run(spark, lake)
+    clean_stats = clean.run(spark, lake).tables
     curated = curate.run(spark, lake)
     loaded = load(lake=lake, db_path=db)
     return {"root": root, "landing": landing, "lake": lake, "db": db, "generated": counts,

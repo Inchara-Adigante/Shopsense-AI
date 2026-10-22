@@ -1,23 +1,34 @@
 """
-Raw -> clean: typed, standardized, deduplicated Parquet.
+Raw -> clean: typed, standardized, deduplicated Parquet - processed incrementally.
 
-For every source table:
-    1. read every raw delivery (the ingest_date folder becomes a column)
+Each run handles only raw deliveries (ingest_date folders) it has not processed
+yet; the processed set is kept in lake/_state/clean_state.json. A backfill
+re-runs a chosen date range, and because every write is a merge + dedupe on the
+business key, re-processing a date never creates duplicates (idempotent).
+
+For every source table in a run:
+    1. read the new raw deliveries (the ingest_date folder becomes a column)
     2. cast to proper types and standardize text (casing, whitespace, enums)
     3. apply validation rules; failing rows go to lake/quarantine/<table>/
        with every reason that applied
     4. deduplicate on the business key; when the same key arrives in several
        deliveries, the latest delivery wins (events: the first one wins, since
        a repeated event_id is a retry of the same event)
-    5. write Parquet partitioned by the *business* date (order_date,
-       event_date, snapshot_date), so a late event lands in the partition of
-       the day it happened, not the day it arrived
+    5. merge into the clean table: only the business-date partitions touched
+       by the new rows are read, re-deduplicated with the new rows, written to
+       a staging area, audited, and then swapped in (write-audit-publish).
+       A late event therefore lands in the partition of the day it happened.
 
 Usage:
-    python -m shopsense.transform.clean
+    python -m shopsense.transform.clean                        # new deliveries only
+    python -m shopsense.transform.clean --from 2026-03-01 --to 2026-03-07   # backfill
+    python -m shopsense.transform.clean --full                 # rebuild from all raw
 """
+import argparse
 import json
-from dataclasses import dataclass
+import shutil
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from pyspark.sql import Column, DataFrame, SparkSession, Window
@@ -38,19 +49,28 @@ class CleanResult:
     rejected: DataFrame
     key: list[str]
     partition_by: str | None = None
+    latest_first: bool = True          # on a key collision: latest delivery wins (False: earliest wins)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def read_raw(spark: SparkSession, raw: Path, source: str, fmt: str) -> DataFrame:
-    path = str(raw / source)
+def raw_dates(raw: Path, source: str) -> list[str]:
+    """ingest_date partitions present in the raw zone for a source."""
+    src = raw / source
+    return sorted(d.name.split("=", 1)[1] for d in src.glob("ingest_date=*")) if src.exists() else []
+
+
+def read_raw(spark: SparkSession, raw: Path, source: str, fmt: str, dates: list[str] | None = None) -> DataFrame:
+    base = raw / source
+    paths = [str(base / f"ingest_date={d}") for d in dates] if dates is not None else [str(base)]
+    reader = spark.read.option("basePath", str(base))      # keep ingest_date as a column
     if fmt == "csv":
         # Read everything as strings: type problems become quarantine reasons, not crashes.
-        df = spark.read.option("header", True).option("inferSchema", False).csv(path)
+        df = reader.option("header", True).option("inferSchema", False).csv(paths)
     else:
-        df = spark.read.json(path)
+        df = reader.json(paths)
     return df.withColumn("ingest_date", F.col("ingest_date").cast("date")) \
              .withColumn("_source_file", F.input_file_name())
 
@@ -159,7 +179,9 @@ def clean_products(raw: DataFrame) -> CleanResult:
         ("unknown category", F.col("category").isNull()),
         ("invalid list_price", F.coalesce(F.col("list_price") <= 0, F.lit(True))),
     ])
-    return CleanResult(dedupe(valid, ["product_id"]), rejected, ["product_id"])
+    # Each delivery is a full catalog snapshot; keep every snapshot (SCD Type 2 is built from them).
+    clean = dedupe(valid.withColumn("snapshot_date", F.col("ingest_date")), ["product_id", "snapshot_date"])
+    return CleanResult(clean, rejected, ["product_id", "snapshot_date"])
 
 
 def clean_customers(raw: DataFrame) -> CleanResult:
@@ -169,13 +191,34 @@ def clean_customers(raw: DataFrame) -> CleanResult:
         F.initcap(F.trim("region")).alias("region"),
         F.lower(F.trim("is_member")).isin("true", "1").alias("is_member"),
         F.trim("age_band").alias("age_band"),
+        F.col("updated_at").try_cast("date").alias("updated_at"),
         "ingest_date", "_source_file",
     )
     valid, rejected = split_valid(df, [
         ("null customer_id", F.col("customer_id").isNull()),
         ("invalid signup_date", F.col("signup_date").isNull()),
+        ("invalid updated_at", F.col("updated_at").isNull()),
     ])
-    return CleanResult(dedupe(valid, ["customer_id"]), rejected, ["customer_id"])
+    # CDC feed: one row per customer per change date (SCD Type 2 is built from them).
+    key = ["customer_id", "updated_at"]
+    return CleanResult(dedupe(valid, key), rejected, key)
+
+
+def clean_order_status(raw: DataFrame) -> CleanResult:
+    df = raw.select(
+        F.trim("order_id").alias("order_id"),
+        canonical(F.col("order_status"), ORDER_STATUSES).alias("order_status"),
+        parse_ts(F.col("status_ts")).alias("status_ts"),
+        "ingest_date", "_source_file",
+    )
+    valid, rejected = split_valid(df, [
+        ("null order_id", F.col("order_id").isNull()),
+        ("unknown order_status", F.col("order_status").isNull()),
+        ("unparseable status_ts", F.col("status_ts").isNull()),
+    ])
+    key = ["order_id", "order_status"]
+    clean = dedupe(valid, key).withColumn("status_date", F.to_date("status_ts"))
+    return CleanResult(clean, rejected, key, "status_date")
 
 
 def clean_promotions(raw: DataFrame) -> CleanResult:
@@ -236,7 +279,7 @@ def clean_clickstream(raw: DataFrame) -> CleanResult:
     clean = (dedupe(valid, ["event_id"], latest_first=False)
              .withColumn("event_date", F.to_date("event_ts"))
              .withColumn("arrival_lag_days", F.datediff("ingest_date", F.to_date("event_ts"))))
-    return CleanResult(clean, rejected, ["event_id"], "event_date")
+    return CleanResult(clean, rejected, ["event_id"], "event_date", latest_first=False)
 
 
 def clean_reviews(raw: DataFrame) -> CleanResult:
@@ -260,71 +303,173 @@ def clean_reviews(raw: DataFrame) -> CleanResult:
 
 
 # ---------------------------------------------------------------------------
-# Runner
+# Incremental runner
 # ---------------------------------------------------------------------------
 
-def write_result(name: str, result: CleanResult, clean_root: Path, quarantine_root: Path) -> dict:
-    clean = result.clean.drop("_source_file")
-    if result.partition_by:
-        # One file per date partition: avoids thousands of tiny files (slow S3 listing / scans).
-        writer = clean.repartition(result.partition_by).write.mode("overwrite").partitionBy(result.partition_by)
+# Processing order matters: order_items validates against clean orders.
+TABLES = {
+    "orders": "csv",
+    "order_status_updates": "csv",
+    "order_items": "csv",
+    "products": "csv",
+    "customers": "csv",
+    "promotions": "csv",
+    "inventory_snapshots": "csv",
+    "clickstream": "json",
+    "reviews": "json",
+}
+
+Audit = Callable[[str, DataFrame], None]
+
+
+@dataclass
+class RunReport:
+    dates: dict[str, list[str]] = field(default_factory=dict)      # ingest dates processed per table
+    tables: dict[str, dict] = field(default_factory=dict)          # stats per table
+
+    def affected(self, table: str) -> list[str]:
+        return self.tables.get(table, {}).get("affected_partitions", [])
+
+
+def _state_path(lake: Path) -> Path:
+    return lake / "_state" / "clean_state.json"
+
+
+def load_state(lake: Path) -> dict[str, list[str]]:
+    path = _state_path(lake)
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def save_state(lake: Path, state: dict[str, list[str]]) -> None:
+    path = _state_path(lake)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(path)                                  # atomic: never a half-written state file
+
+
+def publish(name: str, result: CleanResult, lake: Path, audit: Audit | None = None) -> dict:
+    """Merge new clean rows into lake/clean/<name> through a staging area (write-audit-publish)."""
+    spark = result.clean.sparkSession
+    target, staging = lake / "clean" / name, lake / "_staging" / name
+    new = result.clean
+    pcol = result.partition_by
+    affected = sorted(str(r[0]) for r in new.select(pcol).distinct().collect()) if pcol else []
+
+    if (target / "_SUCCESS").exists() or any(target.glob("*.parquet")) or any(target.glob(f"{pcol}=*")):
+        existing = spark.read.parquet(str(target))
+        if pcol:
+            existing = existing.filter(F.col(pcol).isin(affected))
+        merged = dedupe(new.unionByName(existing.withColumn("_source_file", F.lit("")), allowMissingColumns=True),
+                        result.key, result.latest_first)
     else:
-        writer = clean.coalesce(1).write.mode("overwrite")
-    writer.parquet(str(clean_root / name))
-    as_quarantine(result.rejected, name).coalesce(1).write.mode("overwrite").parquet(str(quarantine_root / name))
+        merged = new
+    merged = merged.drop("_source_file")
 
-    spark = clean.sparkSession
-    written = spark.read.parquet(str(clean_root / name))
-    return {"clean_rows": written.count(),
-            "rejected_rows": spark.read.parquet(str(quarantine_root / name)).count()}
+    # 1. write: stage the merged rows (never read and overwrite the same files in one job).
+    if pcol:
+        merged.repartition(pcol).write.mode("overwrite").partitionBy(pcol).parquet(str(staging))
+    else:
+        merged.coalesce(1).write.mode("overwrite").parquet(str(staging))
+    staged = spark.read.parquet(str(staging))
+
+    # 2. audit: data-quality checks run on the staged data; an exception stops the publish.
+    if audit:
+        audit(name, staged)
+
+    # 3. publish: replace only the affected partitions (dynamic partition overwrite).
+    if pcol:
+        staged.repartition(pcol).write.mode("overwrite").partitionBy(pcol).parquet(str(target))
+    else:
+        staged.coalesce(1).write.mode("overwrite").parquet(str(target))
+    shutil.rmtree(staging, ignore_errors=True)
+    return {"affected_partitions": affected, "table_rows": spark.read.parquet(str(target)).count()}
 
 
-def run(spark: SparkSession | None = None, lake: Path | None = None) -> dict[str, dict]:
+def write_quarantine(name: str, rejected: DataFrame, lake: Path) -> int:
+    q = as_quarantine(rejected, name)
+    q.coalesce(1).write.mode("overwrite").partitionBy("ingest_date").parquet(str(lake / "quarantine" / name))
+    return q.count()
+
+
+def build(name: str, raw: DataFrame, lake: Path) -> CleanResult:
+    spark = raw.sparkSession
+    if name == "order_items":
+        return clean_order_items(raw, spark.read.parquet(str(lake / "clean" / "orders")))
+    return {
+        "orders": clean_orders, "order_status_updates": clean_order_status, "products": clean_products,
+        "customers": clean_customers, "promotions": clean_promotions, "inventory_snapshots": clean_inventory,
+        "clickstream": clean_clickstream, "reviews": clean_reviews,
+    }[name](raw)
+
+
+def run(spark: SparkSession | None = None, lake: Path | None = None, dates: list[str] | None = None,
+        full: bool = False, audit: Audit | None = None) -> RunReport:
+    """
+    dates=None, full=False : process every raw delivery not processed yet (normal daily run)
+    dates=[...]            : (re)process exactly these ingest dates (backfill)
+    full=True              : drop the clean zone and rebuild from all raw deliveries
+    """
     spark = spark or get_spark("shopsense-clean")
     lake = lake or get_paths().lake
-    raw, clean_root, quarantine_root = lake / "raw", lake / "clean", lake / "quarantine"
+    if full:
+        for zone in ("clean", "quarantine", "_staging"):
+            shutil.rmtree(lake / zone, ignore_errors=True)
+        _state_path(lake).unlink(missing_ok=True)
+    state, report = load_state(lake), RunReport()
 
-    def source(name, fmt="csv"):
-        return read_raw(spark, raw, name, fmt)
+    for name, fmt in TABLES.items():
+        available = raw_dates(lake / "raw", name)
+        todo = sorted(set(available) & set(dates)) if dates is not None \
+            else [d for d in available if d not in set(state.get(name, []))]
+        if not todo:
+            continue
+        raw = read_raw(spark, lake / "raw", name, fmt, todo)
+        n_raw = raw.count()
+        result = build(name, raw, lake)
+        n_valid = result.clean.count()
+        stats = {"ingest_dates": len(todo), "raw_rows": n_raw, "valid_rows": n_valid,
+                 "rejected_rows": write_quarantine(name, result.rejected, lake)}
+        stats["duplicates_in_batch"] = n_raw - n_valid - stats["rejected_rows"]
+        stats.update(publish(name, result, lake, audit))
+        report.dates[name], report.tables[name] = todo, stats
+        state[name] = sorted(set(state.get(name, [])) | set(todo))
+        save_state(lake, state)                        # per table: a crash later re-runs only what's left
 
-    stats = {}
-    orders = clean_orders(source("orders"))
-    stats["orders"] = write_result("orders", orders, clean_root, quarantine_root)
-    clean_orders_df = spark.read.parquet(str(clean_root / "orders"))
+    # Orders whose status changed live in older order_date partitions - the warehouse must refresh them too.
+    if "order_status_updates" in report.dates:
+        updated = spark.read.parquet(str(lake / "clean" / "order_status_updates")) \
+            .filter(F.col("ingest_date").isin(report.dates["order_status_updates"])).select("order_id")
+        days = spark.read.parquet(str(lake / "clean" / "orders")).join(updated, "order_id") \
+            .select("order_date").distinct().collect()
+        report.tables["order_status_updates"]["affected_order_dates"] = sorted(str(r[0]) for r in days)
 
-    steps = {
-        "order_items": lambda: clean_order_items(source("order_items"), clean_orders_df),
-        "products": lambda: clean_products(source("products")),
-        "customers": lambda: clean_customers(source("customers")),
-        "promotions": lambda: clean_promotions(source("promotions")),
-        "inventory_snapshots": lambda: clean_inventory(source("inventory_snapshots")),
-        "clickstream": lambda: clean_clickstream(source("clickstream", "json")),
-        "reviews": lambda: clean_reviews(source("reviews", "json")),
-    }
-    for name, build in steps.items():
-        stats[name] = write_result(name, build(), clean_root, quarantine_root)
-
-    # Input row counts, for the run summary (raw rows = clean + rejected + duplicates).
-    for name, fmt in [("orders", "csv"), ("order_items", "csv"), ("products", "csv"), ("customers", "csv"),
-                      ("promotions", "csv"), ("inventory_snapshots", "csv"), ("clickstream", "json"),
-                      ("reviews", "json")]:
-        n_raw = source(name, fmt).count()
-        s = stats[name]
-        s["raw_rows"] = n_raw
-        s["duplicates_removed"] = n_raw - s["clean_rows"] - s["rejected_rows"]
-
-    audit = lake / "_audit" / "clean_run.json"
-    audit.parent.mkdir(parents=True, exist_ok=True)
-    audit.write_text(json.dumps(stats, indent=2))
-    return stats
+    audit_file = lake / "_audit" / "clean_runs.jsonl"
+    audit_file.parent.mkdir(parents=True, exist_ok=True)
+    with audit_file.open("a") as fh:
+        fh.write(json.dumps({"tables": {k: {kk: vv for kk, vv in v.items() if kk != "affected_partitions"}
+                                        for k, v in report.tables.items()}}) + "\n")
+    return report
 
 
 def main() -> None:
-    stats = run()
-    print(f"{'table':<22}{'raw':>11}{'clean':>11}{'rejected':>10}{'dupes':>9}")
-    for name, s in stats.items():
-        print(f"{name:<22}{s['raw_rows']:>11,}{s['clean_rows']:>11,}{s['rejected_rows']:>10,}{s['duplicates_removed']:>9,}")
-    print(f"\nclean zone -> {get_paths().clean}")
+    parser = argparse.ArgumentParser(description="Clean raw deliveries into the clean zone (incremental).")
+    parser.add_argument("--from", dest="date_from", help="backfill start ingest date (YYYY-MM-DD)")
+    parser.add_argument("--to", dest="date_to", help="backfill end ingest date (inclusive)")
+    parser.add_argument("--full", action="store_true", help="rebuild the clean zone from all raw data")
+    args = parser.parse_args()
+
+    dates = None
+    if args.date_from:
+        import pandas as pd
+        dates = [d.strftime("%Y-%m-%d") for d in pd.date_range(args.date_from, args.date_to or args.date_from)]
+    report = run(dates=dates, full=args.full)
+    if not report.tables:
+        print("nothing new to process")
+    print(f"{'table':<22}{'dates':>6}{'raw':>11}{'valid':>11}{'rejected':>9}{'dupes':>8}{'parts':>7}{'rows now':>11}")
+    for name, s in report.tables.items():
+        print(f"{name:<22}{s['ingest_dates']:>6}{s['raw_rows']:>11,}{s['valid_rows']:>11,}{s['rejected_rows']:>9,}"
+              f"{s['duplicates_in_batch']:>8,}{len(s['affected_partitions']):>7}{s['table_rows']:>11,}")
 
 
 if __name__ == "__main__":

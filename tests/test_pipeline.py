@@ -18,13 +18,13 @@ def q(con, sql):
 
 def test_clean_row_counts_reconcile(pipeline):
     for table, s in pipeline["clean"].items():
-        assert s["raw_rows"] == s["clean_rows"] + s["rejected_rows"] + s["duplicates_removed"], table
-    assert pipeline["clean"]["orders"]["duplicates_removed"] > 0
+        assert s["raw_rows"] == s["valid_rows"] + s["rejected_rows"] + s["duplicates_in_batch"], table
+    assert pipeline["clean"]["orders"]["duplicates_in_batch"] > 0
     assert pipeline["clean"]["order_items"]["rejected_rows"] > 0
 
 
 def test_every_clean_order_line_reaches_the_fact(pipeline):
-    assert pipeline["curated"]["fact_order_item"] == pipeline["clean"]["order_items"]["clean_rows"]
+    assert pipeline["curated"]["fact_order_item"] == pipeline["clean"]["order_items"]["table_rows"]
 
 
 def test_revenue_reconciles_between_lake_and_warehouse(pipeline, con):
@@ -44,7 +44,7 @@ def test_converted_sessions_match_orders(pipeline, con):
     # Every clean order has exactly one purchase session. (Compare with clean orders, not
     # fact_order_item: an order whose only line was quarantined has no fact rows.)
     [(converted,)] = q(con, "SELECT SUM(converted::INT) FROM dw.fact_session")
-    assert converted == pipeline["clean"]["orders"]["clean_rows"]
+    assert converted == pipeline["clean"]["orders"]["table_rows"]
 
 
 def test_inventory_risk_is_consistent(con):

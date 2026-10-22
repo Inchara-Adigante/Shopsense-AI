@@ -40,7 +40,7 @@ def run(skip_generate: bool = False, days: int | None = None) -> dict:
     step("ingest", lambda: {"batches": len(ingest())})
     spark = get_spark("shopsense-pipeline")
     try:
-        step("clean", lambda: clean.run(spark))
+        step("clean", lambda: clean.run(spark).tables)
         step("curate", lambda: curate.run(spark))
     finally:
         spark.stop()
