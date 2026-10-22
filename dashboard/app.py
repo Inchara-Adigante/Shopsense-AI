@@ -60,8 +60,8 @@ c3.metric("Session conversion (28d)", f"{conv:.1%}")
 c4.metric("Out of stock now", int(tiers.get("Out of stock", 0)), help="product x fulfillment center")
 c5.metric("High stockout risk", int(tiers.get("High", 0)), help="under 7 days of cover")
 
-tab_restock, tab_drivers, tab_sales, tab_health = st.tabs(
-    ["📦 Restock this week", "📈 Demand drivers", "💰 Sales & funnel", "🩺 Pipeline health"])
+tab_live, tab_restock, tab_drivers, tab_sales, tab_health = st.tabs(
+    ["⚡ Live", "📦 Restock this week", "📈 Demand drivers", "💰 Sales & funnel", "🩺 Pipeline health"])
 
 # ---------------------------------------------------------------- restock
 with tab_restock:
@@ -196,3 +196,66 @@ with tab_health:
         st.dataframe(runs.sort_values("end_date", ascending=False).head(20), hide_index=True, width="stretch")
     else:
         st.caption("No Airflow runs recorded yet (see airflow/README.md).")
+
+# ---------------------------------------------------------------- live (streaming)
+def live_query(sql: str) -> pd.DataFrame | None:
+    """Short-lived read-only connection: the stream job needs the file for writing between our reads."""
+    from shopsense.streaming.stream_job import connect_with_retry, live_db_path
+    if not live_db_path().exists():
+        return None
+    con = connect_with_retry(live_db_path(), read_only=True)
+    try:
+        return con.execute(sql).df()
+    finally:
+        con.close()
+
+
+with tab_live:
+    st.subheader("What is happening right now?")
+    stock = live_query("SELECT * FROM live.stock_now")
+    if stock is None:
+        st.info("No live stream yet. Start it with `python -m shopsense.streaming.producer --speed 360` and "
+                "`python -m shopsense.streaming.stream_job --continuous` (see docs/streaming.md).")
+    else:
+        if st.button("🔄 Refresh"):
+            st.rerun()
+        head = live_query("""SELECT (SELECT MAX(event_ts) FROM live.click_events) AS latest_click,
+                                    (SELECT COUNT(*) FROM live.click_events) AS clicks,
+                                    (SELECT COUNT(DISTINCT order_id) FROM live.order_lines) AS orders,
+                                    (SELECT COALESCE(SUM(net_amount), 0) FROM live.order_lines) AS revenue""").iloc[0]
+        l1, l2, l3, l4, l5 = st.columns(5)
+        l1.metric("Stream position", "-" if pd.isna(head.latest_click) else f"{pd.Timestamp(head.latest_click):%H:%M}")
+        l2.metric("Events today", f"{int(head.clicks):,}")
+        l3.metric("Orders today", f"{int(head.orders):,}")
+        l4.metric("Revenue today", f"${head.revenue:,.0f}")
+        l5.metric("Sold out today", int((stock["live_alert"] == "Sold out today").sum()),
+                  help="had stock this morning, none left now")
+
+        st.markdown("**Live stock alerts** (start-of-day stock − units sold so far)")
+        alerts = stock[stock["live_alert"] != "OK"].sort_values(["alert_rank", "hours_of_cover"])
+        st.dataframe(alerts[["live_alert", "product_id", "product_name", "fc_id", "start_on_hand", "units_sold_today",
+                             "on_hand_now", "hours_of_cover", "inbound_units"]], hide_index=True, width="stretch")
+
+        left, right = st.columns(2)
+        with left:
+            st.caption("Page views per 5 minutes")
+            act = live_query("SELECT window_start, SUM(page_views) AS page_views FROM live.product_activity_5m "
+                             "GROUP BY 1 ORDER BY 1")
+            st.line_chart(act, x="window_start", y="page_views", height=220)
+        with right:
+            st.caption("Units sold per 5 minutes")
+            units = live_query("SELECT window_start, SUM(units) AS units FROM live.units_5m GROUP BY 1 ORDER BY 1")
+            st.bar_chart(units, x="window_start", y="units", height=220)
+
+        from shopsense.streaming.producer import stream_root
+        prog_file = stream_root() / "_progress" / "progress.jsonl"
+        st.markdown("**Stream health**")
+        lag = live_query("SELECT ROUND(AVG(avg_lag_s), 1) AS avg_lag_s, MAX(max_lag_s) AS max_lag_s FROM live.stream_lag")
+        h1, h2, h3, h4 = st.columns(4)
+        h1.metric("Avg arrival delay", f"{lag.avg_lag_s.iloc[0]} s")
+        h2.metric("Max arrival delay", f"{lag.max_lag_s.iloc[0]:,.0f} s")
+        if prog_file.exists():
+            prog = pd.DataFrame([json.loads(x) for x in prog_file.read_text().splitlines() if x.strip()])
+            h3.metric("Micro-batches", f"{len(prog):,}")
+            h4.metric("Dropped as too late", int(prog["rows_dropped_by_watermark"].sum()),
+                      help="events more than 10 minutes behind the watermark")
