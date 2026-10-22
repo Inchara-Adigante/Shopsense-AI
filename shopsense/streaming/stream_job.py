@@ -132,7 +132,7 @@ def start(spark: SparkSession, topic: str, root: Path, db: Path, checkpoints: Pa
     (root / topic).mkdir(parents=True, exist_ok=True)        # the topic may not have received a file yet
     events = (spark.readStream.schema(SCHEMAS[topic])
               .option("timestampFormat", TS_FORMAT)
-              .option("maxFilesPerTrigger", 5)                 # ~5 simulated minutes per micro-batch
+              .option("maxFilesPerTrigger", int(os.getenv("SHOPSENSE_STREAM_MAX_FILES", "5")))  # ~5 min per batch
               .json(str(root / topic)))
     deduped = events.withWatermark("event_ts", WATERMARK).dropDuplicatesWithinWatermark(["event_id"])
     writer = (deduped.writeStream.queryName(topic).outputMode("append")

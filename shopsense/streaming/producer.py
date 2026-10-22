@@ -77,7 +77,8 @@ def schedule(events: pd.DataFrame, rng: np.random.Generator) -> tuple[pd.DataFra
     return sent, events.loc[too_late, "event_id"].tolist()
 
 
-def write_files(topics: dict[str, pd.DataFrame], root: Path, speed: float | None) -> dict[str, int]:
+def write_files(topics: dict[str, pd.DataFrame], root: Path, speed: float | None,
+                file_minutes: int = 1) -> dict[str, int]:
     """
     One JSON-lines file per topic per minute of arrival time, written atomically (tmp file + rename).
     All topics are interleaved by arrival time, so in live mode they stream side by side.
@@ -85,7 +86,8 @@ def write_files(topics: dict[str, pd.DataFrame], root: Path, speed: float | None
     batches = []
     for topic, sent in topics.items():
         (root / topic).mkdir(parents=True, exist_ok=True)
-        for minute, batch in sent.assign(minute=sent["arrival_ts"].dt.floor("min")).groupby("minute"):
+        bucket = sent["arrival_ts"].dt.floor(f"{file_minutes}min")
+        for minute, batch in sent.assign(minute=bucket).groupby("minute"):
             batches.append((minute, topic, batch.drop(columns="minute")))
     batches.sort(key=lambda b: (b[0], b[1]))
     n_files = {t: 0 for t in topics}
@@ -111,7 +113,7 @@ def write_files(topics: dict[str, pd.DataFrame], root: Path, speed: float | None
 
 
 def produce(day: str, lake: Path | None = None, root: Path | None = None, speed: float | None = None,
-            seed: int = SEED) -> dict:
+            seed: int = SEED, file_minutes: int = 1) -> dict:
     lake, root = lake or get_paths().lake, root or stream_root()
     for sub in ("clicks", "orders", "_truth"):
         shutil.rmtree(root / sub, ignore_errors=True)
@@ -127,7 +129,7 @@ def produce(day: str, lake: Path | None = None, root: Path | None = None, speed:
     (root / "_truth").mkdir(parents=True, exist_ok=True)
     for topic, truth in truths.items():
         (root / "_truth" / f"{topic}.json").write_text(json.dumps(truth))
-    files = write_files(sent_by_topic, root, speed)
+    files = write_files(sent_by_topic, root, speed, file_minutes)
     for topic, truth in truths.items():
         summary[topic] = {k: v for k, v in truth.items() if k != "too_late_event_ids"} | {
             "too_late": len(truth["too_late_event_ids"]), "files": files[topic]}
