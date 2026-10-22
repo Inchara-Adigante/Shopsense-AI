@@ -24,3 +24,13 @@ derby.log
 # Streaming demo output (rebuilt by the producer / stream job)
 stream/
 warehouse/streaming.duckdb*
+
+# Terraform / build output
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+dist/
+build/
+*.egg-info/

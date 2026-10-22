@@ -1,0 +1,5 @@
+# Copy to terraform.tfvars (gitignored) and adjust.
+region             = "us-east-1"
+environment        = "dev"
+budget_alert_email = "you@example.com"
+enable_redshift    = false   # set true only while you need Redshift; it bills per RPU-hour
