@@ -13,7 +13,7 @@ An end-to-end retail data platform that turns orders, customer activity, invento
 | **1. Core platform** | Retail data → S3-style lake → PySpark transformations → star-schema warehouse → dashboard | ✅ Done |
 | **2. Production reliability** | Incremental loads and backfills, SCD Type 2, data-quality gates, Airflow orchestration, monitoring, runbook, performance evidence | ✅ Done |
 | **3. Streaming** | Live orders and clicks with late, too-late and duplicate deliveries; Spark Structured Streaming with watermark, dedup and an exactly-once sink; live stock alerts | ✅ Done |
-| 4. AI | Review summaries and a business assistant that cites the metrics behind its answers | Next |
+| **4. AI** | A business assistant that answers from the warehouse through read-only tools, cites the rows behind every number, and has a number-level grounding check; per-product review summaries | ✅ Done |
 | AWS deployment | Real S3 (MinIO locally), Glue jobs, Redshift Serverless | Planned. Today these are local stand-ins (see [Notes](#notes-and-limitations)). |
 
 ## Architecture
@@ -67,9 +67,10 @@ flowchart LR
 | Monitoring | Dashboard tab for freshness, failing checks, quarantine trend, recent loads and Airflow runs, plus an incident runbook | `dashboard/app.py`, `docs/runbook.md` |
 | Redshift | Same schema with `DISTSTYLE ALL` dimensions, `DISTKEY(product_key)`, `SORTKEY(date_key)`, S3 `COPY`, and the incremental `DELETE`/`INSERT` pattern (reference, not yet run on AWS) | `sql/redshift/create_tables.sql` |
 
+| AI | Five read-only SQL tools with citation refs. A Claude (`claude-opus-5-5`) tool-use loop with strict schemas, a cached system prompt and refusal fallbacks, or an offline keyword router when no API key is set. A grounding check rejects any number not found in a tool result. Review summaries use SQL numbers, with extractive or Claude Batches text. | `shopsense/ai/` |
 | Streaming | A producer replays a day as a messy live stream. Spark Structured Streaming applies a 10-minute watermark and `dropDuplicatesWithinWatermark`, then `foreachBatch` → `INSERT OR IGNORE` (exactly-once with checkpoints). Live views compute 5-minute activity, units sold and stock right now, with alerts. | `shopsense/streaming/`, `sql/live/live.sql` |
 
-Details: [data model](docs/data_model.md) · [streaming](docs/streaming.md) · [performance](docs/performance.md) · [runbook](docs/runbook.md) · [Airflow](airflow/README.md)
+Details: [data model](docs/data_model.md) · [AI](docs/ai.md) · [streaming](docs/streaming.md) · [performance](docs/performance.md) · [runbook](docs/runbook.md) · [Airflow](airflow/README.md)
 
 ## How the stockout answer is built
 
@@ -129,6 +130,14 @@ Replaying Jun 29 (5,626 click events and 289 order lines, sent as 6,080 deliveri
 
 ![Live tab](docs/images/dashboard_live.png)
 
+### AI assistant ([details](docs/ai.md))
+- Answers the four core questions (what to restock, why a product is selling, what customers say, recent sales) with **every number traced to a cited warehouse row**. For example, *"Why is P00121 selling so fast?"* → driver *Promotion* (lift ×2.22), 202 vs 164 units, and per-FC stock and actions. Grounding result: 15 of 15 numbers supported.
+- The grounding check flags invented figures (tested with a fabricated "$9,876,543 next month").
+- Review summaries for the 282 products with at least 3 reviews.
+- **Honest status:** the Claude path is tested with a scripted fake client (loop, request shape, errors, refusals, grounding) but **hasn't been run against the live API** here, because no key was available. Without a key, the deterministic offline mode answers instead, and that's what the screenshot shows.
+
+![Ask ShopSense](docs/images/dashboard_ask.png)
+
 ### Performance ([details](docs/performance.md))
 
 | Experiment | Before | After |
@@ -160,7 +169,10 @@ On macOS, install Java with `brew install openjdk@21`. To set up Airflow, see [a
 python -m shopsense.pipeline                 # fresh run: generate → ingest → clean → curate → load → backtest
 python -m shopsense.pipeline --skip-generate # incremental: only new deliveries
 streamlit run dashboard/app.py               # http://localhost:8501
-pytest                                       # 37 tests, about 6.5 minutes
+pytest                                       # 50 tests, about 6.5 minutes
+
+# AI (see docs/ai.md) - uses Claude when ANTHROPIC_API_KEY is set, otherwise offline mode
+python -m shopsense.ai.assistant "Which products need restocking this week in Boston?"
 
 # streaming (see docs/streaming.md)
 python -m shopsense.streaming.producer --day 2026-06-29 --speed 60    # live replay
@@ -194,6 +206,11 @@ Shopsense-AI/
 │   │   ├── clean.py               # incremental raw → clean, write-audit-publish
 │   │   └── curate.py              # star schema, SCD Type 2
 │   ├── quality/checks.py          # lake + warehouse data-quality gates
+│   ├── ai/
+│   │   ├── tools.py               # read-only SQL tools with citation refs
+│   │   ├── assistant.py           # Claude tool-use loop + offline router
+│   │   ├── grounding.py           # every number must come from a tool result
+│   │   └── reviews.py             # per-product review summaries
 │   ├── streaming/
 │   │   ├── producer.py            # messy live replay (late, too-late, duplicates)
 │   │   └── stream_job.py          # Structured Streaming → exactly-once live tables
@@ -207,7 +224,7 @@ Shopsense-AI/
 │   ├── live/live.sql              # live tables + 5-minute / stock views
 │   └── redshift/create_tables.sql
 ├── airflow/dags/shopsense_daily.py
-├── dashboard/app.py               # Streamlit: live, restock, drivers, sales, pipeline health
+├── dashboard/app.py               # Streamlit: ask, live, restock, drivers, sales, pipeline health
 ├── docs/                          # data model, runbook, performance, screenshots
 └── tests/                         # unit, end-to-end, incremental-vs-full
 ```
@@ -216,4 +233,5 @@ Shopsense-AI/
 - **Synthetic data:** the retailer is simulated, so the right answer is known. That makes the backtest and the SCD2 price check possible.
 - **Local stand-ins for AWS:** the lake uses the S3 layout on local disk, Spark runs locally instead of on Glue, DuckDB stands in for Redshift, and file-based topics stand in for Kinesis or Kafka (the mapping is in docs/streaming.md). The Redshift DDL is written but has not been run on AWS.
 - **Curated is rebuilt each run** (about 20 s here), while clean and the warehouse are incremental. At larger scale, curate would also process only the changed partitions.
+- **AI:** without an API key the assistant uses deterministic templates, so its language is plain; the Claude path is written and tested against a fake client but not yet run against the live API.
 - **Lead time** is fixed at 10 days for the reorder recommendation, because the inventory feed doesn't carry supplier lead times.
