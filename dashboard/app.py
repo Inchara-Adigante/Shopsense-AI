@@ -4,6 +4,7 @@ ShopSense AI dashboard (Streamlit), reading the warehouse marts.
 Run:
     streamlit run dashboard/app.py
 """
+import json
 import sys
 from pathlib import Path
 
@@ -59,7 +60,8 @@ c3.metric("Session conversion (28d)", f"{conv:.1%}")
 c4.metric("Out of stock now", int(tiers.get("Out of stock", 0)), help="product x fulfillment center")
 c5.metric("High stockout risk", int(tiers.get("High", 0)), help="under 7 days of cover")
 
-tab_restock, tab_drivers, tab_sales = st.tabs(["📦 Restock this week", "📈 Demand drivers", "💰 Sales & funnel"])
+tab_restock, tab_drivers, tab_sales, tab_health = st.tabs(
+    ["📦 Restock this week", "📈 Demand drivers", "💰 Sales & funnel", "🩺 Pipeline health"])
 
 # ---------------------------------------------------------------- restock
 with tab_restock:
@@ -132,3 +134,65 @@ with tab_sales:
     f3.metric("Purchased", f"{int(funnel.purchased):,}", f"{funnel.purchased / funnel.sessions:.1%} of sessions")
     f4.metric("Saw an out-of-stock page", f"{int(funnel.hit_out_of_stock):,}",
               f"{funnel.hit_out_of_stock / funnel.sessions:.1%} of sessions", delta_color="inverse")
+
+# ---------------------------------------------------------------- pipeline health
+def table_exists(schema: str, table: str) -> bool:
+    return bool(query("SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+                      (schema, table))["n"].iloc[0])
+
+
+with tab_health:
+    st.subheader("Can we trust today's numbers?")
+
+    fresh = query("""
+        SELECT 'orders' AS feed, MAX(d.date) AS latest FROM dw.fact_order_item JOIN dw.dim_date d USING (date_key)
+        UNION ALL SELECT 'inventory', MAX(d.date) FROM dw.fact_inventory_daily JOIN dw.dim_date d USING (date_key)
+        UNION ALL SELECT 'clickstream', MAX(d.date) FROM dw.fact_session JOIN dw.dim_date d USING (date_key)
+        UNION ALL SELECT 'reviews', MAX(d.date) FROM dw.fact_review JOIN dw.dim_date d USING (date_key)""")
+    fresh["days_behind"] = (pd.Timestamp(as_of) - pd.to_datetime(fresh["latest"])).dt.days
+    cols = st.columns(len(fresh))
+    for col, row in zip(cols, fresh.itertuples()):
+        col.metric(f"{row.feed} freshness", f"{pd.Timestamp(row.latest):%b %d}",
+                   "up to date" if row.days_behind <= 1 else f"{row.days_behind} days behind",
+                   delta_color="normal" if row.days_behind <= 1 else "inverse")
+
+    if table_exists("ops", "dq_results"):
+        dq = query("""
+            SELECT *, row_number() OVER (PARTITION BY stage, table_name, check_name ORDER BY checked_at DESC) AS rn
+            FROM ops.dq_results""")
+        latest = dq[dq["rn"] == 1]
+        failing = latest[~latest["passed"]]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Checks (latest result each)", len(latest))
+        c2.metric("Failing errors", int(((~latest["passed"]) & (latest["severity"] == "error")).sum()))
+        c3.metric("Failing warnings", int(((~latest["passed"]) & (latest["severity"] == "warn")).sum()))
+        if len(failing):
+            st.warning("Failing checks - see docs/runbook.md for recovery steps")
+            st.dataframe(failing[["stage", "severity", "table_name", "check_name", "observed", "threshold", "message",
+                                  "checked_at"]], hide_index=True, width="stretch")
+        else:
+            st.success("All data-quality checks passing")
+        rates = dq[dq["check_name"] == "quarantine_rate"].pivot_table(index="checked_at", columns="table_name",
+                                                                        values="observed", aggfunc="max")
+        if len(rates) > 1:
+            st.caption("Quarantine rate per clean run")
+            st.line_chart(rates * 100, height=200, y_label="% of raw rows rejected")
+        with st.expander("All latest check results"):
+            st.dataframe(latest.drop(columns="rn").sort_values(["stage", "table_name"]), hide_index=True, width="stretch")
+    else:
+        st.info("No data-quality results yet.")
+
+    st.markdown("**Recent warehouse loads**")
+    if table_exists("ops", "load_log"):
+        st.dataframe(query("""SELECT run_id, MIN(loaded_at) AS loaded_at, string_agg(DISTINCT mode, ', ') AS modes,
+                                     SUM(rows_deleted) AS rows_deleted, SUM(rows_inserted) AS rows_inserted
+                              FROM ops.load_log GROUP BY run_id ORDER BY loaded_at DESC LIMIT 10"""),
+                     hide_index=True, width="stretch")
+
+    runs_file = get_paths().lake / "_audit" / "pipeline_runs.jsonl"
+    st.markdown("**Airflow runs**")
+    if runs_file.exists():
+        runs = pd.DataFrame([json.loads(line) for line in runs_file.read_text().splitlines() if line.strip()])
+        st.dataframe(runs.sort_values("end_date", ascending=False).head(20), hide_index=True, width="stretch")
+    else:
+        st.caption("No Airflow runs recorded yet (see airflow/README.md).")

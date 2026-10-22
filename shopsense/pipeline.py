@@ -4,7 +4,9 @@ Run the full stage 1 pipeline end to end:
     generate -> ingest (landing -> raw) -> clean (Spark) -> curate (Spark) -> warehouse load -> backtest
 
 Each step is timed and the run summary is written to lake/_audit/pipeline_run.json.
-Stage 2 moves these steps into an Airflow DAG with retries and backfills.
+Without --skip-generate the lake and warehouse are rebuilt from scratch; with it,
+clean and load are incremental (only new deliveries). For scheduled daily runs with
+retries and backfills, use the Airflow DAG in airflow/dags/shopsense_daily.py.
 
 Usage:
     python -m shopsense.pipeline                  # full run, regenerating data
@@ -12,6 +14,7 @@ Usage:
 """
 import argparse
 import json
+import shutil
 import time
 from datetime import datetime, timezone
 
@@ -36,6 +39,9 @@ def run(skip_generate: bool = False, days: int | None = None) -> dict:
         return result
 
     if not skip_generate:
+        # New simulated history -> start from an empty lake and warehouse.
+        shutil.rmtree(paths.lake, ignore_errors=True)
+        paths.warehouse_db.unlink(missing_ok=True)
         step("generate", lambda: generate(**({"n_days": days} if days else {})))
     step("ingest", lambda: {"batches": len(ingest())})
     spark = get_spark("shopsense-pipeline")
@@ -44,7 +50,7 @@ def run(skip_generate: bool = False, days: int | None = None) -> dict:
         step("curate", lambda: curate.run(spark))
     finally:
         spark.stop()
-    step("load", load)
+    step("load", lambda: {k: v for k, v in load().items() if k in ("run_id", "mode")})
     bt = step("backtest", lambda: backtest.run().round(3).reset_index().to_dict(orient="records"))
 
     summary["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
