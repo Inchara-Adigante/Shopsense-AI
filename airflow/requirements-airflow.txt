@@ -1,0 +1,4 @@
+# Install into a separate virtualenv with the official constraints file:
+#   pip install -r airflow/requirements-airflow.txt \
+#     --constraint https://raw.githubusercontent.com/apache/airflow/constraints-3.3.2/constraints-3.12.txt
+apache-airflow==3.3.2
