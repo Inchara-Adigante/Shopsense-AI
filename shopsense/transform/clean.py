@@ -416,6 +416,7 @@ def run(spark: SparkSession | None = None, lake: Path | None = None, dates: list
         for zone in ("clean", "quarantine", "_staging"):
             shutil.rmtree(lake / zone, ignore_errors=True)
         _state_path(lake).unlink(missing_ok=True)
+        pending_changes_path(lake).unlink(missing_ok=True)
     state, report = load_state(lake), RunReport()
 
     for name, fmt in TABLES.items():
@@ -444,12 +445,36 @@ def run(spark: SparkSession | None = None, lake: Path | None = None, dates: list
             .select("order_date").distinct().collect()
         report.tables["order_status_updates"]["affected_order_dates"] = sorted(str(r[0]) for r in days)
 
+    record_pending_changes(lake, report)
     audit_file = lake / "_audit" / "clean_runs.jsonl"
     audit_file.parent.mkdir(parents=True, exist_ok=True)
     with audit_file.open("a") as fh:
         fh.write(json.dumps({"tables": {k: {kk: vv for kk, vv in v.items() if kk != "affected_partitions"}
                                         for k, v in report.tables.items()}}) + "\n")
     return report
+
+
+def pending_changes_path(lake: Path) -> Path:
+    return lake / "_state" / "pending_warehouse_changes.json"
+
+
+def record_pending_changes(lake: Path, report: RunReport) -> None:
+    """
+    Accumulate which business dates changed, for the warehouse load to pick up.
+    Kept in a file (not passed in memory) so clean and load can run as separate
+    Airflow tasks; the load clears it only after a successful commit.
+    """
+    path = pending_changes_path(lake)
+    pending = json.loads(path.read_text()) if path.exists() else {}
+    for table, stats in report.tables.items():
+        dates = set(stats.get("affected_partitions", [])) | set(stats.get("affected_order_dates", []))
+        pending[table] = sorted(set(pending.get(table, [])) | dates) if dates else pending.get(table, [])
+        pending.setdefault("_changed_tables", [])
+        pending["_changed_tables"] = sorted(set(pending["_changed_tables"]) | {table})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(pending, indent=2))
+    tmp.replace(path)
 
 
 def main() -> None:

@@ -40,7 +40,8 @@ st.caption(f"Data as of **{pd.Timestamp(as_of):%b %d, %Y}** · Which products wi
 # Orders are counted from the fact table: summing mart.daily_sales.orders would double-count
 # orders that contain items from more than one category.
 kpi = query("""
-    WITH f AS (SELECT d.date, f.order_id, f.net_amount FROM dw.fact_order_item f JOIN dw.dim_date d USING (date_key)),
+    WITH f AS (SELECT d.date, f.order_id, f.net_amount FROM dw.fact_order_item f JOIN dw.dim_date d USING (date_key)
+               WHERE f.order_status <> 'cancelled'),
          l AS (SELECT MAX(date) d FROM f)
     SELECT SUM(net_amount) FILTER (WHERE date >  l.d - INTERVAL 28 DAY) AS rev_28,
            SUM(net_amount) FILTER (WHERE date <= l.d - INTERVAL 28 DAY AND date > l.d - INTERVAL 56 DAY) AS rev_prev,

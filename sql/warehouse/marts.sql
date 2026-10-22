@@ -13,13 +13,16 @@
 -- Grain: date x category. "orders" counts orders containing that category, so do not
 -- sum it across categories (an order with two categories would be counted twice).
 CREATE OR REPLACE VIEW mart.daily_sales AS
+-- Cancelled orders are excluded from revenue; returns are reported separately.
 SELECT d.date, p.category,
-       COUNT(DISTINCT f.order_id)              AS orders,
-       SUM(f.quantity)                         AS units,
-       SUM(f.gross_amount)                     AS gross_revenue,
-       SUM(f.discount_amount)                  AS discounts,
-       SUM(f.net_amount)                       AS net_revenue,
-       SUM(f.net_amount - f.cost_amount)       AS gross_margin
+       COUNT(DISTINCT f.order_id) FILTER (WHERE f.order_status <> 'cancelled')           AS orders,
+       SUM(f.quantity)            FILTER (WHERE f.order_status <> 'cancelled')           AS units,
+       SUM(f.gross_amount)        FILTER (WHERE f.order_status <> 'cancelled')           AS gross_revenue,
+       SUM(f.discount_amount)     FILTER (WHERE f.order_status <> 'cancelled')           AS discounts,
+       SUM(f.net_amount)          FILTER (WHERE f.order_status <> 'cancelled')           AS net_revenue,
+       SUM(f.net_amount - f.cost_amount) FILTER (WHERE f.order_status <> 'cancelled')    AS gross_margin,
+       SUM(f.net_amount)          FILTER (WHERE f.order_status = 'returned')             AS returned_revenue,
+       COUNT(DISTINCT f.order_id) FILTER (WHERE f.order_status = 'cancelled')            AS cancelled_orders
 FROM dw.fact_order_item f
 JOIN dw.dim_date d    USING (date_key)
 JOIN dw.dim_product p USING (product_key)
