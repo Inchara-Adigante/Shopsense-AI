@@ -18,18 +18,72 @@
 
 ```mermaid
 flowchart LR
-    SRC["Simulated sources<br/>orders · status · items · clicks<br/>inventory · catalog · customers<br/>promotions · reviews"] --> LAND[("landing")]
-    LAND -->|checksummed ingest| RAW[("raw<br/>S3 or local")]
-    RAW -->|"PySpark clean<br/>(incremental, WAP)"| CLEAN[("clean")]
-    RAW -.->|invalid| Q[("quarantine")]
-    CLEAN -->|"PySpark curate<br/>(SCD2)"| CUR[("curated")]
-    CUR -->|"upsert dims,<br/>replace fact partitions"| WH[("warehouse<br/>DuckDB / Redshift")]
-    WH --> MART["marts"] --> DASH["dashboard"]
-    MART --> AI["assistant<br/>(tools + grounding)"] --> DASH
-    LIVE["live stream"] -->|"Structured Streaming<br/>watermark + dedup"| LDB[("live tables")] --> DASH
-    WH -.->|start-of-day stock| LDB
-    DQ{{"quality gates"}} -.-> CLEAN & WH
-    ORCH{{"Airflow / Glue workflow"}} -.-> RAW & CLEAN & CUR & WH
+    subgraph SRC["Sources · simulated retailer"]
+        direction TB
+        STREAM["<b>Live replay</b><br/>orders + clicks<br/>late · too-late · duplicates"]
+        BATCH["<b>Daily deliveries</b><br/>orders · items · status<br/>clicks · inventory<br/>catalog · customers<br/>promotions · reviews"]
+    end
+
+    subgraph RT["Real time · Spark Structured Streaming"]
+        SS["<b>Stream job</b><br/>10-min watermark<br/>dedup within watermark"]
+        LIVE[("<b>live tables</b><br/>exactly-once sink")]
+    end
+
+    subgraph BP["Batch · daily, orchestrated by Airflow 3 or a Glue workflow"]
+        subgraph LAKE["Data lake · local disk or S3"]
+            RAW[("<b>raw</b><br/>immutable<br/>SHA-256 manifests")]
+            STG[("<b>staging</b>")]
+            GATE{{"<b>Quality gate</b><br/>keys · nulls · volume<br/>quarantine rate"}}
+            CLEAN[("<b>clean</b><br/>Parquet by<br/>business date")]
+            CUR[("<b>curated</b><br/>star schema<br/>SCD Type 2")]
+            Q[("<b>quarantine</b><br/>bad rows + reason")]
+        end
+        subgraph WH["Warehouse · DuckDB or Redshift"]
+            DW[("<b>dw</b><br/>5 dims · 5 facts")]
+            MART["<b>mart</b><br/>restock · risk · drivers<br/>sales · funnel"]
+            OPS[("<b>ops</b><br/>load log · DQ results")]
+        end
+    end
+
+    subgraph SERVE["Serving"]
+        direction TB
+        AI["<b>AI assistant</b><br/>read-only SQL tools<br/>citations · grounding check"]
+        DASH["<b>Streamlit dashboard</b><br/>Ask · Live · Restock<br/>Drivers · Sales · Health"]
+    end
+
+    STREAM --> SS --> LIVE
+    BATCH -->|ingest| RAW
+    RAW -->|"PySpark clean<br/>new deliveries only"| STG
+    RAW -.->|invalid rows| Q
+    STG --> GATE -->|publish| CLEAN
+    CLEAN -->|PySpark curate| CUR
+    CUR -->|"incremental load<br/>one transaction<br/>+ DQ checks"| DW
+    DW --> MART
+    DW -.-> OPS
+    DW -.->|start-of-day stock| LIVE
+    MART --> AI --> DASH
+    MART --> DASH
+    OPS --> DASH
+    LIVE --> DASH
+
+    classDef src fill:#eef2ff,stroke:#6366f1,color:#1e1b4b
+    classDef store fill:#ecfdf5,stroke:#10b981,color:#064e3b
+    classDef bad fill:#fef2f2,stroke:#ef4444,color:#7f1d1d
+    classDef proc fill:#fff7ed,stroke:#f97316,color:#7c2d12
+    classDef serve fill:#f5f3ff,stroke:#8b5cf6,color:#2e1065
+    classDef gate fill:#fefce8,stroke:#ca8a04,color:#422006
+    class BATCH,STREAM src
+    class RAW,STG,CLEAN,CUR,DW,OPS,LIVE store
+    class Q bad
+    class MART,SS proc
+    class AI,DASH serve
+    class GATE gate
+    style SRC fill:#fafafa,stroke:#a1a1aa,color:#27272a
+    style RT fill:#fafafa,stroke:#a1a1aa,color:#27272a
+    style BP fill:#fafafa,stroke:#a1a1aa,color:#27272a
+    style LAKE fill:#ffffff,stroke:#d4d4d8,color:#27272a
+    style WH fill:#ffffff,stroke:#d4d4d8,color:#27272a
+    style SERVE fill:#fafafa,stroke:#a1a1aa,color:#27272a
 ```
 
 ## 3. Key design decisions

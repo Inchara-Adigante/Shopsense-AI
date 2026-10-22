@@ -22,39 +22,72 @@ An end-to-end retail data platform that turns orders, customer activity, invento
 
 ```mermaid
 flowchart LR
-    subgraph Sources["Source systems (simulated)"]
-        GEN["retail_data.py<br/>orders · status updates · items · clicks<br/>inventory · catalog snapshots · customer CDC<br/>promotions · reviews"]
+    subgraph SRC["Sources · simulated retailer"]
+        direction TB
+        STREAM["<b>Live replay</b><br/>orders + clicks<br/>late · too-late · duplicates"]
+        BATCH["<b>Daily deliveries</b><br/>orders · items · status<br/>clicks · inventory<br/>catalog · customers<br/>promotions · reviews"]
     end
-    LAND[("landing/")]
-    subgraph Lake["Data lake (S3 layout, local folders)"]
-        RAW[("raw/ ingest_date=…<br/>immutable + checksums")]
-        STG[("_staging/")]
-        CLEAN[("clean/<br/>Parquet by business date")]
-        Q[("quarantine/")]
-        CUR[("curated/<br/>star schema, SCD2 dims")]
-        STATE[("_state/ watermarks<br/>pending changes")]
-    end
-    subgraph WH["Warehouse (DuckDB · Redshift DDL included)"]
-        DW[("dw.* dims + facts")]
-        OPS[("ops.load_log<br/>ops.dq_results")]
-        MART["mart.* sales · funnel · risk<br/>drivers · restock"]
-    end
-    AF{{"Airflow<br/>shopsense_daily"}}
-    DQ["Data-quality gates"]
-    DASH["Streamlit dashboard<br/>+ pipeline health"]
 
-    GEN --> LAND -->|ingest| RAW
-    RAW -->|PySpark clean, new dates only| STG
-    STG -->|audit| DQ
-    DQ -->|publish changed partitions| CLEAN
-    RAW -->|invalid rows| Q
-    CLEAN --> STATE
+    subgraph RT["Real time · Spark Structured Streaming"]
+        SS["<b>Stream job</b><br/>10-min watermark<br/>dedup within watermark"]
+        LIVE[("<b>live tables</b><br/>exactly-once sink")]
+    end
+
+    subgraph BP["Batch · daily, orchestrated by Airflow 3 or a Glue workflow"]
+        subgraph LAKE["Data lake · local disk or S3"]
+            RAW[("<b>raw</b><br/>immutable<br/>SHA-256 manifests")]
+            STG[("<b>staging</b>")]
+            GATE{{"<b>Quality gate</b><br/>keys · nulls · volume<br/>quarantine rate"}}
+            CLEAN[("<b>clean</b><br/>Parquet by<br/>business date")]
+            CUR[("<b>curated</b><br/>star schema<br/>SCD Type 2")]
+            Q[("<b>quarantine</b><br/>bad rows + reason")]
+        end
+        subgraph WH["Warehouse · DuckDB or Redshift"]
+            DW[("<b>dw</b><br/>5 dims · 5 facts")]
+            MART["<b>mart</b><br/>restock · risk · drivers<br/>sales · funnel"]
+            OPS[("<b>ops</b><br/>load log · DQ results")]
+        end
+    end
+
+    subgraph SERVE["Serving"]
+        direction TB
+        AI["<b>AI assistant</b><br/>read-only SQL tools<br/>citations · grounding check"]
+        DASH["<b>Streamlit dashboard</b><br/>Ask · Live · Restock<br/>Drivers · Sales · Health"]
+    end
+
+    STREAM --> SS --> LIVE
+    BATCH -->|ingest| RAW
+    RAW -->|"PySpark clean<br/>new deliveries only"| STG
+    RAW -.->|invalid rows| Q
+    STG --> GATE -->|publish| CLEAN
     CLEAN -->|PySpark curate| CUR
-    CUR -->|upsert dims, replace fact partitions| DW
-    DW --> DQ
-    DW --> MART --> DASH
+    CUR -->|"incremental load<br/>one transaction<br/>+ DQ checks"| DW
+    DW --> MART
+    DW -.-> OPS
+    DW -.->|start-of-day stock| LIVE
+    MART --> AI --> DASH
+    MART --> DASH
     OPS --> DASH
-    AF -.orchestrates.-> RAW & CLEAN & CUR & DW
+    LIVE --> DASH
+
+    classDef src fill:#eef2ff,stroke:#6366f1,color:#1e1b4b
+    classDef store fill:#ecfdf5,stroke:#10b981,color:#064e3b
+    classDef bad fill:#fef2f2,stroke:#ef4444,color:#7f1d1d
+    classDef proc fill:#fff7ed,stroke:#f97316,color:#7c2d12
+    classDef serve fill:#f5f3ff,stroke:#8b5cf6,color:#2e1065
+    classDef gate fill:#fefce8,stroke:#ca8a04,color:#422006
+    class BATCH,STREAM src
+    class RAW,STG,CLEAN,CUR,DW,OPS,LIVE store
+    class Q bad
+    class MART,SS proc
+    class AI,DASH serve
+    class GATE gate
+    style SRC fill:#fafafa,stroke:#a1a1aa,color:#27272a
+    style RT fill:#fafafa,stroke:#a1a1aa,color:#27272a
+    style BP fill:#fafafa,stroke:#a1a1aa,color:#27272a
+    style LAKE fill:#ffffff,stroke:#d4d4d8,color:#27272a
+    style WH fill:#ffffff,stroke:#d4d4d8,color:#27272a
+    style SERVE fill:#fafafa,stroke:#a1a1aa,color:#27272a
 ```
 
 | Layer | What happens | Code |
