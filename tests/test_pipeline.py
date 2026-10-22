@@ -67,3 +67,16 @@ def test_backtest_runs(pipeline):
     assert set(result.index) == {"adjusted", "naive"}
     assert result.attrs["observations"] > 0
     assert result["precision"].between(0, 1).all()
+
+
+def test_order_lines_use_the_product_version_valid_on_the_order_date(con):
+    [(mismatch,)] = q(con, "SELECT COUNT(*) FROM dw.fact_order_item f JOIN dw.dim_product p USING (product_key) "
+                           "WHERE f.unit_price <> p.list_price")
+    assert mismatch == 0
+    [(versions,)] = q(con, "SELECT COUNT(*) FROM dw.dim_product WHERE version > 1")
+    assert versions > 0, "repricing should create SCD2 versions"
+
+
+def test_order_status_comes_from_the_status_feed(con):
+    statuses = {s for (s,) in q(con, "SELECT DISTINCT order_status FROM dw.fact_order_item")}
+    assert {"delivered", "shipped"} <= statuses
