@@ -353,7 +353,8 @@ class RetailSimulator:
 
         # Browse-only sessions (no order), some with abandoned carts.
         n_browse = len(items["o"].unique()) * BROWSE_SESSIONS_PER_ORDER
-        browse_cust = rng.choice(len(self.customers), size=n_browse)
+        signed_up = np.flatnonzero((self.customers["signup_date"] <= day).to_numpy())
+        browse_cust = rng.choice(signed_up, size=n_browse)       # only existing customers can log in
         guest = rng.random(n_browse) < 0.2
         for i in range(n_browse):
             sid = self._next("session", 1)[0]
