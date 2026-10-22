@@ -29,3 +29,29 @@ jobs:
         env:
           SPARK_DRIVER_MEMORY: 2g
         run: pytest -q
+
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - run: terraform fmt -check -recursive
+      - run: terraform init -backend=false -input=false
+      - run: terraform validate
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the wheel the Glue jobs import
+        run: pip wheel --no-deps -w dist . && ls dist
+      - name: Glue entry script compiles
+        run: python -m py_compile infra/glue/shopsense_job.py
