@@ -77,6 +77,11 @@ def read_raw(spark: SparkSession, raw: Path, source: str, fmt: str, dates: list[
              .withColumn("_source_file", F.input_file_name())
 
 
+def try_cast(col: str, type_name: str) -> Column:
+    """NULL instead of an error for unparseable values. SQL try_cast works on Spark 3.5 (AWS Glue 5.0) and 4.x."""
+    return F.expr(f"try_cast(`{col}` AS {type_name})")
+
+
 def parse_ts(col: Column) -> Column:
     """Accept ISO-8601 UTC ('2026-01-05T13:45:10Z') and the legacy US format ('01/05/2026 13:45:10')."""
     return F.coalesce(F.try_to_timestamp(col, F.lit("yyyy-MM-dd'T'HH:mm:ss'Z'")),
@@ -145,11 +150,11 @@ def clean_orders(raw: DataFrame) -> CleanResult:
 def clean_order_items(raw: DataFrame, orders: DataFrame) -> CleanResult:
     df = raw.select(
         F.trim("order_id").alias("order_id"),
-        F.col("line_number").try_cast("int").alias("line_number"),
+        try_cast("line_number", "int").alias("line_number"),
         F.trim("product_id").alias("product_id"),
-        F.col("quantity").try_cast("int").alias("quantity"),
-        F.col("unit_price").try_cast("decimal(10,2)").alias("unit_price"),
-        F.col("discount_amount").try_cast("decimal(10,2)").alias("discount_amount"),
+        try_cast("quantity", "int").alias("quantity"),
+        try_cast("unit_price", "decimal(10,2)").alias("unit_price"),
+        try_cast("discount_amount", "decimal(10,2)").alias("discount_amount"),
         "ingest_date", "_source_file",
     )
     known = orders.select("order_id", "order_date").withColumn("_known", F.lit(True))
@@ -171,9 +176,9 @@ def clean_products(raw: DataFrame) -> CleanResult:
         F.trim("product_name").alias("product_name"),
         canonical(F.col("category"), CATEGORIES).alias("category"),
         F.trim("brand").alias("brand"),
-        F.col("list_price").try_cast("decimal(10,2)").alias("list_price"),
-        F.col("unit_cost").try_cast("decimal(10,2)").alias("unit_cost"),
-        F.col("launch_date").try_cast("date").alias("launch_date"),
+        try_cast("list_price", "decimal(10,2)").alias("list_price"),
+        try_cast("unit_cost", "decimal(10,2)").alias("unit_cost"),
+        try_cast("launch_date", "date").alias("launch_date"),
         "ingest_date", "_source_file",
     )
     valid, rejected = split_valid(df, [
@@ -189,11 +194,11 @@ def clean_products(raw: DataFrame) -> CleanResult:
 def clean_customers(raw: DataFrame) -> CleanResult:
     df = raw.select(
         F.trim("customer_id").alias("customer_id"),
-        F.col("signup_date").try_cast("date").alias("signup_date"),
+        try_cast("signup_date", "date").alias("signup_date"),
         F.initcap(F.trim("region")).alias("region"),
         F.lower(F.trim("is_member")).isin("true", "1").alias("is_member"),
         F.trim("age_band").alias("age_band"),
-        F.col("updated_at").try_cast("date").alias("updated_at"),
+        try_cast("updated_at", "date").alias("updated_at"),
         "ingest_date", "_source_file",
     )
     valid, rejected = split_valid(df, [
@@ -227,9 +232,9 @@ def clean_promotions(raw: DataFrame) -> CleanResult:
     df = raw.select(
         F.trim("promo_id").alias("promo_id"),
         F.trim("product_id").alias("product_id"),
-        F.col("start_date").try_cast("date").alias("start_date"),
-        F.col("end_date").try_cast("date").alias("end_date"),
-        F.col("discount_pct").try_cast("decimal(4,2)").alias("discount_pct"),
+        try_cast("start_date", "date").alias("start_date"),
+        try_cast("end_date", "date").alias("end_date"),
+        try_cast("discount_pct", "decimal(4,2)").alias("discount_pct"),
         "ingest_date", "_source_file",
     )
     valid, rejected = split_valid(df, [
@@ -241,12 +246,12 @@ def clean_promotions(raw: DataFrame) -> CleanResult:
 
 def clean_inventory(raw: DataFrame) -> CleanResult:
     df = raw.select(
-        F.col("snapshot_date").try_cast("date").alias("snapshot_date"),
+        try_cast("snapshot_date", "date").alias("snapshot_date"),
         F.upper(F.trim("fc_id")).alias("fc_id"),
         F.trim("product_id").alias("product_id"),
-        F.col("on_hand_units").try_cast("int").alias("on_hand_units"),
-        F.col("inbound_units").try_cast("int").alias("inbound_units"),
-        F.col("reorder_point").try_cast("int").alias("reorder_point"),
+        try_cast("on_hand_units", "int").alias("on_hand_units"),
+        try_cast("inbound_units", "int").alias("inbound_units"),
+        try_cast("reorder_point", "int").alias("reorder_point"),
         "ingest_date", "_source_file",
     )
     valid, rejected = split_valid(df, [
@@ -291,7 +296,7 @@ def clean_reviews(raw: DataFrame) -> CleanResult:
         F.trim("customer_id").alias("customer_id"),
         F.trim("order_id").alias("order_id"),
         parse_ts(F.col("review_ts")).alias("review_ts"),
-        F.col("rating").try_cast("int").alias("rating"),
+        try_cast("rating", "int").alias("rating"),
         F.trim("title").alias("title"),
         F.trim("body").alias("body"),
         "ingest_date", "_source_file",
