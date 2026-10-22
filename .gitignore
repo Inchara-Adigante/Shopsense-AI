@@ -20,3 +20,7 @@ derby.log
 .DS_Store
 .vscode/
 .idea/
+
+# Streaming demo output (rebuilt by the producer / stream job)
+stream/
+warehouse/streaming.duckdb*
