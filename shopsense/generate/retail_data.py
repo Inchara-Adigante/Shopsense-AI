@@ -428,7 +428,7 @@ def inject_dirty(day_tables: dict[str, pd.DataFrame], rng: np.random.Generator) 
 
     o["order_ts"] = _fmt_ts(o["order_ts"])
     legacy = rng.random(len(o)) < 0.02          # older checkout service writes US-style timestamps
-    o.loc[legacy, "order_ts"] = pd.to_datetime(o.loc[legacy, "order_ts"]).dt.strftime("%m/%d/%Y %H:%M:%S")
+    o.loc[legacy, "order_ts"] = pd.to_datetime(o.loc[legacy, "order_ts"], format="%Y-%m-%dT%H:%M:%SZ").dt.strftime("%m/%d/%Y %H:%M:%S")
     messy = rng.random(len(o)) < 0.03
     o.loc[messy, "order_status"] = rng.choice(["PLACED", " placed", "Placed "], size=messy.sum())
     t["orders"] = pd.concat([o, o[rng.random(len(o)) < 0.01]], ignore_index=True)      # resent rows

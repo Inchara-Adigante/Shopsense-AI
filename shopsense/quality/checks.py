@@ -100,6 +100,9 @@ def lake_checks(table: str, staged: DataFrame, key: list[str], target: Path, run
     add("unique_key", ERROR, dupes == 0, dupes, "0", f"{dupes} duplicate {'+'.join(key)} values")
 
     for col in NOT_NULL.get(table, []):
+        if col not in staged.columns:                 # schema drift: a required column disappeared
+            add(f"not_null:{col}", ERROR, False, None, "column present", f"column {col} is missing")
+            continue
         nulls = staged.filter(F.col(col).isNull()).count()
         add(f"not_null:{col}", ERROR, nulls == 0, nulls, "0", f"{nulls} null {col}")
 
