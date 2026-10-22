@@ -53,6 +53,12 @@ def run(db_path=None) -> pd.DataFrame:
                           pd.Timestamp(hi) - pd.Timedelta(days=HORIZON_DAYS), freq="W-MON")
     frames = [con.execute(QUERY, {"as_of": d.date()}).df().assign(as_of=d) for d in dates]
     con.close()
+    if not frames:                                     # history shorter than 28 + HORIZON_DAYS days
+        empty = pd.DataFrame([{"method": m, "flagged": 0, "caught": 0, "missed": 0, "precision": None,
+                               "recall": None} for m in ("adjusted", "naive")]).set_index("method")
+        empty.attrs.update(weeks=0, observations=0, stockouts=0,
+                           note=f"needs at least {28 + HORIZON_DAYS} days of history")
+        return empty
     df = pd.concat(frames, ignore_index=True)
     rows = [{"method": m, **scores(df[f"flag_{m}"].astype(bool), df["stocked_out"].astype(bool))}
             for m in ("adjusted", "naive")]
