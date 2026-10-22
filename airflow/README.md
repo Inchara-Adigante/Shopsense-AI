@@ -4,7 +4,7 @@ Two DAGs in [`dags/shopsense_daily.py`](dags/shopsense_daily.py):
 
 | DAG | Schedule | Tasks |
 |---|---|---|
-| `shopsense_daily` | `@daily`, `catchup=True`, one run at a time | `wait_for_landing` → `ingest` → `clean` → `curate` → `load_warehouse` |
+| `shopsense_daily` | `@daily`, `catchup=True`, one run at a time | `wait_for_landing` → `ingest` → `clean` → `curate` → `load_warehouse` → `review_summaries` |
 | `shopsense_reprocess` | manual, with `date_from` / `date_to` params | `reclean_range` → `curate` → `load_warehouse` |
 
 - **Retries:** 2 retries with exponential backoff (2 → 20 minutes). A retry is always safe, because every step is idempotent.

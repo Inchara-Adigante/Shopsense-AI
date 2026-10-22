@@ -1,7 +1,7 @@
 """
 ShopSense daily pipeline (Airflow 3).
 
-    wait_for_landing -> ingest -> clean -> curate -> load_warehouse
+    wait_for_landing -> ingest -> clean -> curate -> load_warehouse -> review_summaries
 
 * One DAG run per landing date ({{ ds }}). catchup=True turns the DAG into a
   backfill engine: un-run dates are processed oldest first, one at a time
@@ -99,8 +99,9 @@ def shopsense_daily():
     clean = job("clean", "shopsense.transform.clean", timeout_min=60)
     curate = job("curate", "shopsense.transform.curate", timeout_min=60)
     load = job("load_warehouse", "shopsense.warehouse.load", timeout_min=20)
+    reviews = job("review_summaries", "shopsense.ai.reviews", timeout_min=90)   # Claude batches can take a while
 
-    wait_for_landing() >> ingest >> clean >> curate >> load
+    wait_for_landing() >> ingest >> clean >> curate >> load >> reviews
 
 
 shopsense_daily()
