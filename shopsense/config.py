@@ -53,6 +53,7 @@ def get_paths() -> Paths:
 SOURCES = {
     "orders": "csv",
     "order_items": "csv",
+    "order_status_updates": "csv",
     "products": "csv",
     "customers": "csv",
     "inventory_snapshots": "csv",

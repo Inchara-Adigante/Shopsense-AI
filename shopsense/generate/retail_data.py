@@ -4,11 +4,12 @@ Synthetic retail data generator.
 Simulates an online retailer day by day and drops files into the landing area
 the way upstream systems would:
 
-    landing/products/<date>/products.csv             catalog extract (day 1)
-    landing/customers/<date>/customers.csv           customer extract (day 1)
+    landing/products/<date>/products.csv             full catalog snapshot (day 1, then every Monday)
+    landing/customers/<date>/customers.csv           customer changes that day (CDC: new + changed rows)
     landing/promotions/<date>/promotions.csv         promotion calendar (day 1)
     landing/orders/<date>/orders.csv                 orders placed that day
     landing/order_items/<date>/order_items.csv       their line items
+    landing/order_status_updates/<date>/...csv       shipped / delivered / cancelled / returned events
     landing/inventory_snapshots/<date>/inventory.csv end-of-day stock per FC
     landing/clickstream/<date>/events.json.gz        web/app events (JSON lines)
     landing/reviews/<date>/reviews.json              reviews posted that day
@@ -22,6 +23,10 @@ How the simulation works
       shopper sees an out-of-stock page.
     * Replenishment: a reorder-point policy per product x FC with a supplier lead
       time. Some products get deliberately thin safety stock, so stockouts occur.
+    * Change over time: ~6% of products change price every Monday, customers
+      move region or change membership, and orders progress through
+      placed -> shipped -> delivered (some cancelled, some returned). These
+      drive incremental loads and SCD Type 2 dimensions downstream.
     * Dirty data: duplicate rows and events, late-arriving events, mixed
       timestamp formats, inconsistent casing, and a few invalid values.
 
@@ -74,6 +79,10 @@ FCS = list(REGION_FC.values())
 DOW_FACTOR = [0.95, 0.9, 0.92, 0.98, 1.08, 1.15, 1.02]   # Mon..Sun
 BROWSE_SESSIONS_PER_ORDER = 9                            # ~10% session conversion
 PROMO_ELASTICITY = 2.5                                   # 20% off -> demand x1.5
+WEEKLY_PRICE_CHANGE_SHARE = 0.06                         # products repriced each Monday
+DAILY_MOVE_PROB = 0.0003                                 # customer moves to another region
+DAILY_MEMBERSHIP_FLIP_PROB = 0.0005                      # joins / cancels membership
+CANCEL_RATE, RETURN_RATE = 0.02, 0.05
 
 POSITIVE = ["Exactly what I needed.", "Great quality for the price.", "Would buy again.", "Arrived quickly and works well."]
 NEUTRAL = ["Does the job.", "Okay overall, nothing special.", "Decent, but a bit overpriced."]
@@ -166,6 +175,8 @@ class RetailSimulator:
         self.cust_fc = self.customers["region"].map(REGION_FC).map(self.fc_index).to_numpy()
         self._init_inventory()
         self.counters = {"order": 0, "event": 0, "session": 0, "review": 0}
+        self.status_due: dict[int, list[tuple]] = {}               # day index -> status updates
+        self.changed_customers: set[int] = set()
 
     def _init_inventory(self):
         """Reorder-point policy per product x FC, sized from expected demand."""
@@ -203,6 +214,22 @@ class RetailSimulator:
 
     def simulate_day(self, d: int) -> dict[str, pd.DataFrame]:
         rng, day = self.rng, START_DATE + pd.Timedelta(days=d)
+
+        # 0. Master data changes: Monday repricing, customer moves and membership changes.
+        if day.dayofweek == 0 and d > 0:
+            repriced = rng.random(self.n_p) < WEEKLY_PRICE_CHANGE_SHARE
+            factor = rng.uniform(0.85, 1.15, repriced.sum())
+            new_price = np.maximum(np.round(self.products.loc[repriced, "list_price"].to_numpy() * factor, 2), 2.99)
+            self.products.loc[repriced, "list_price"] = new_price
+        signed_up = (self.customers["signup_date"] <= day).to_numpy()
+        moves = np.flatnonzero(signed_up & (rng.random(len(self.customers)) < DAILY_MOVE_PROB))
+        for i in moves:
+            others = [r for r in REGION_FC if r != self.customers.at[i, "region"]]
+            self.customers.at[i, "region"] = rng.choice(others)
+            self.cust_fc[i] = self.fc_index[REGION_FC[self.customers.at[i, "region"]]]
+        flips = np.flatnonzero(signed_up & (rng.random(len(self.customers)) < DAILY_MEMBERSHIP_FLIP_PROB))
+        self.customers.loc[flips, "is_member"] = ~self.customers.loc[flips, "is_member"]
+        self.changed_customers = set(moves) | set(flips)
 
         # 1. Supplier deliveries arrive.
         if d in self.arrivals:
@@ -248,9 +275,35 @@ class RetailSimulator:
             self.inbound[fc, p] += self.order_qty[fc, p]
 
         orders, order_items = self._order_tables(day, sold, cust_idx, order_seq, order_ts)
+        self._schedule_status_updates(d, orders)
         events = self._events(day, items, sold, lost, cust_idx, order_seq, order_ts, probs)
         inventory = self._inventory_snapshot(day)
-        return {"orders": orders, "order_items": order_items, "events": events, "inventory": inventory}
+        updates = pd.DataFrame(self.status_due.pop(d, []), columns=["order_id", "order_status", "status_ts"])
+        return {"orders": orders, "order_items": order_items, "events": events, "inventory": inventory,
+                "status_updates": updates.sort_values("status_ts")}
+
+    def _schedule_status_updates(self, d: int, orders: pd.DataFrame) -> None:
+        """Order lifecycle: placed -> shipped -> delivered, with cancellations and returns."""
+        rng = self.rng
+        for oid, ts in zip(orders["order_id"], orders["order_ts"]):
+            def add(days_after, status, base=ts):
+                when = base + pd.Timedelta(seconds=int(days_after * 86400))
+                self.status_due.setdefault((when.normalize() - START_DATE).days, []).append((oid, status, when))
+                return when
+            if rng.random() < CANCEL_RATE:
+                add(rng.uniform(0.05, 1.0), "cancelled")
+                continue
+            shipped = add(rng.uniform(0.5, 2.0), "shipped")
+            delivered = add(rng.uniform(2.0, 5.0), "delivered", shipped)
+            if rng.random() < RETURN_RATE:
+                add(rng.uniform(5.0, 20.0), "returned", delivered)
+
+    def customer_changes(self, d: int) -> pd.DataFrame:
+        """CDC feed for day d: customers who signed up that day plus customers whose attributes changed."""
+        day = START_DATE + pd.Timedelta(days=d)
+        new = (self.customers["signup_date"] <= day) if d == 0 else (self.customers["signup_date"] == day)
+        rows = self.customers[new.to_numpy() | self.customers.index.isin(self.changed_customers)]
+        return rows.drop(columns=["_activity"]).assign(updated_at=day)
 
     def _order_tables(self, day, sold, cust_idx, order_seq, order_ts):
         p = self.products
@@ -383,6 +436,12 @@ def inject_dirty(day_tables: dict[str, pd.DataFrame], rng: np.random.Generator) 
     oi.loc[bad, "quantity"] = rng.choice([0, -1], size=bad.sum())
     t["order_items"] = pd.concat([oi, oi[rng.random(len(oi)) < 0.01]], ignore_index=True)
 
+    su = t["status_updates"]
+    su["status_ts"] = _fmt_ts(su["status_ts"]) if len(su) else su["status_ts"]
+    loud = rng.random(len(su)) < 0.02
+    su.loc[loud, "order_status"] = su.loc[loud, "order_status"].str.upper()
+    t["status_updates"] = pd.concat([su, su[rng.random(len(su)) < 0.01]], ignore_index=True)
+
     ev["event_ts"] = _fmt_ts(ev["event_ts"])
     shout = rng.random(len(ev)) < 0.01
     ev.loc[shout, "event_type"] = ev.loc[shout, "event_type"].str.upper()
@@ -406,15 +465,16 @@ def generate(n_days: int = N_DAYS, seed: int = SEED, landing: Path | None = None
     first = START_DATE.strftime("%Y-%m-%d")
     counts = {}
 
-    # Master data extracts, delivered once on day 1 (stage 2 adds changed extracts).
-    products = sim.products.drop(columns=["_popularity", "_quality"]).copy()
-    messy = rng.random(len(products)) < 0.03
-    products.loc[messy, "category"] = [rng.choice([c.lower(), c.upper(), f" {c} "]) for c in products.loc[messy, "category"]]
-    _write_csv(products, landing / "products" / first / "products.csv")
-    customers = sim.customers.drop(columns=["_activity"])
-    _write_csv(customers, landing / "customers" / first / "customers.csv")
+    def write_product_snapshot(date_dir: str) -> int:
+        products = sim.products.drop(columns=["_popularity", "_quality"]).copy()
+        messy = rng.random(len(products)) < 0.03
+        products.loc[messy, "category"] = [rng.choice([c.lower(), c.upper(), f" {c} "])
+                                           for c in products.loc[messy, "category"]]
+        _write_csv(products, landing / "products" / date_dir / "products.csv")
+        return len(products)
+
     _write_csv(sim.promotions, landing / "promotions" / first / "promotions.csv")
-    counts.update(products=len(products), customers=len(customers), promotions=len(sim.promotions))
+    counts.update(products=0, customers=0, promotions=len(sim.promotions), order_status_updates=0)
 
     all_orders, all_items, late = [], [], None
     for d in range(n_days):
@@ -424,6 +484,18 @@ def generate(n_days: int = N_DAYS, seed: int = SEED, landing: Path | None = None
         all_items.append(tables["order_items"])
         dirty = inject_dirty(tables, rng)
         date_dir = day.strftime("%Y-%m-%d")
+
+        # Catalog snapshot on day 1 and every Monday (after that day's repricing).
+        if d == 0 or day.dayofweek == 0:
+            counts["products"] += write_product_snapshot(date_dir)
+        changes = sim.customer_changes(d)
+        if len(changes):
+            _write_csv(changes, landing / "customers" / date_dir / "customers.csv")
+            counts["customers"] += len(changes)
+        upd = dirty["status_updates"]
+        if len(upd):
+            _write_csv(upd, landing / "order_status_updates" / date_dir / "order_status_updates.csv")
+            counts["order_status_updates"] += len(upd)
 
         # ~1% of events reach the pipeline a day late (mobile apps offline, retries).
         ev = dirty["events"]
