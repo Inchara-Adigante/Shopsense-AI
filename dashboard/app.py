@@ -294,6 +294,9 @@ with tab_ask:
             st.error(f"Unsupported numbers (not found in any tool result): {', '.join(g['unsupported'])}")
         if answer.citations:
             st.markdown("**Sources**")
-            st.dataframe(pd.DataFrame(answer.citations).set_index("ref"), width="stretch")
+            sources = pd.DataFrame([{"ref": c["ref"], "values": ", ".join(
+                f"{k}={v}" for k, v in c.items() if k != "ref" and v is not None)} for c in answer.citations])
+            st.dataframe(sources, hide_index=True, width="stretch",
+                         column_config={"values": st.column_config.TextColumn(width="large")})
         with st.expander("Tool calls"):
             st.json(answer.tool_calls)
