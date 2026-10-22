@@ -11,94 +11,125 @@ An end-to-end retail data platform that turns orders, customer activity, invento
 | Stage | Scope | Status |
 |---|---|---|
 | **1. Core platform** | Retail data → S3-style lake → PySpark transformations → star-schema warehouse → dashboard | ✅ Done |
-| 2. Production reliability | Airflow orchestration, incremental loads, data-quality checks, monitoring, backfills, SCD Type 2, real S3 (MinIO/AWS) | Planned |
-| 3. Streaming | Simulated live orders and clicks, deduplication, late-event handling with watermarks | Planned |
+| **2. Production reliability** | Incremental loads and backfills, SCD Type 2, data-quality gates, Airflow orchestration, monitoring, runbook, performance evidence | ✅ Done |
+| 3. Streaming | Simulated live orders and clicks, deduplication, late-event handling with watermarks | Next |
 | 4. AI | Review summaries and a business assistant that cites the metrics behind its answers | Planned |
+| AWS deployment | Real S3 (MinIO locally), Glue jobs, Redshift Serverless | Planned. Today these are local stand-ins (see [Notes](#notes-and-limitations)). |
 
-## Architecture (stage 1)
+## Architecture
 
 ```mermaid
 flowchart LR
     subgraph Sources["Source systems (simulated)"]
-        GEN["retail_data.py<br/>orders · items · clicks · inventory<br/>products · customers · promotions · reviews"]
+        GEN["retail_data.py<br/>orders · status updates · items · clicks<br/>inventory · catalog snapshots · customer CDC<br/>promotions · reviews"]
     end
-    LAND[("landing/<br/>CSV · JSON · json.gz")]
+    LAND[("landing/")]
     subgraph Lake["Data lake (S3 layout, local folders)"]
-        RAW[("raw/<br/>ingest_date=…<br/>immutable + checksums")]
-        CLEAN[("clean/<br/>Parquet, by business date")]
-        Q[("quarantine/<br/>rejected rows + reason")]
-        CUR[("curated/<br/>star schema Parquet")]
+        RAW[("raw/ ingest_date=…<br/>immutable + checksums")]
+        STG[("_staging/")]
+        CLEAN[("clean/<br/>Parquet by business date")]
+        Q[("quarantine/")]
+        CUR[("curated/<br/>star schema, SCD2 dims")]
+        STATE[("_state/ watermarks<br/>pending changes")]
     end
     subgraph WH["Warehouse (DuckDB · Redshift DDL included)"]
-        DW[("dw.* dims + facts<br/>PKs enforced")]
-        MART["mart.* views<br/>sales · funnel · inventory risk<br/>demand drivers · restock"]
+        DW[("dw.* dims + facts")]
+        OPS[("ops.load_log<br/>ops.dq_results")]
+        MART["mart.* sales · funnel · risk<br/>drivers · restock"]
     end
-    DASH["Streamlit dashboard"]
-    BT["Backtest<br/>stockout flag vs reality"]
+    AF{{"Airflow<br/>shopsense_daily"}}
+    DQ["Data-quality gates"]
+    DASH["Streamlit dashboard<br/>+ pipeline health"]
 
-    GEN --> LAND -->|land_raw.py| RAW
-    RAW -->|PySpark clean.py| CLEAN
-    RAW -->|invalid| Q
-    CLEAN -->|PySpark curate.py| CUR
-    CUR -->|load.py + integrity checks| DW --> MART
-    MART --> DASH
-    MART --> BT
+    GEN --> LAND -->|ingest| RAW
+    RAW -->|PySpark clean, new dates only| STG
+    STG -->|audit| DQ
+    DQ -->|publish changed partitions| CLEAN
+    RAW -->|invalid rows| Q
+    CLEAN --> STATE
+    CLEAN -->|PySpark curate| CUR
+    CUR -->|upsert dims, replace fact partitions| DW
+    DW --> DQ
+    DW --> MART --> DASH
+    OPS --> DASH
+    AF -.orchestrates.-> RAW & CLEAN & CUR & DW
 ```
 
 | Layer | What happens | Code |
 |---|---|---|
-| Generate | Six months of a simulated retailer: popularity × seasonality × promotions drive demand; five fulfillment centers with reorder-point policies produce real stockouts; dirty data is injected on purpose | `shopsense/generate/retail_data.py` |
-| Ingest | Landing → raw, copied byte-for-byte into `ingest_date=` partitions with SHA-256 manifests. Re-runs are skipped; a changed re-delivery is refused unless `--force` | `shopsense/ingest/land_raw.py` |
-| Clean (PySpark) | Typing, two timestamp formats, canonical categories and statuses, validation rules → quarantine with reasons, dedup on business keys, Parquet partitioned by business date (late events land in the right day) | `shopsense/transform/clean.py` |
-| Curate (PySpark) | Star schema: 5 dimensions with surrogate keys and unknown members, 5 facts at explicit grains | `shopsense/transform/curate.py` |
-| Warehouse | Full refresh in one transaction, enforced primary keys, orphan-key and row-count checks, business marts | `shopsense/warehouse/load.py`, `sql/warehouse/` |
-| Redshift | Same schema with `DISTSTYLE ALL` dimensions, `DISTKEY(product_key)`, `SORTKEY(date_key)` and S3 `COPY` (reference, not yet run on AWS) | `sql/redshift/create_tables.sql` |
-| Dashboard | Restock list with actions, demand drivers per product, sales and funnel | `dashboard/app.py` |
+| Generate | Six months of a simulated retailer. Popularity × seasonality × promotions drive demand, and five fulfillment centers with reorder policies produce real stockouts. Products are repriced every Monday, customers move or change membership, and orders are shipped, delivered, cancelled or returned. Dirty data is injected on purpose. | `shopsense/generate/retail_data.py` |
+| Ingest | Landing → raw, copied byte-for-byte into `ingest_date=` partitions with SHA-256 manifests. Re-runs are skipped; a changed re-delivery is refused unless `--force`. | `shopsense/ingest/land_raw.py` |
+| Clean (PySpark, incremental) | Processes only unseen deliveries (watermark state). Handles typing, two timestamp formats and canonical values; invalid rows go to quarantine with a reason; duplicates are removed on business keys. New rows are **merged into only the business-date partitions they touch** via staging → quality checks → publish. Backfills (`--from/--to`) are idempotent. | `shopsense/transform/clean.py` |
+| Curate (PySpark) | Star schema with **SCD Type 2** product and customer dimensions, stable hash surrogate keys, point-in-time lookups, and the latest order status. | `shopsense/transform/curate.py` |
+| Warehouse (incremental) | Dimensions are upserted by primary key; facts **replace only the changed date partitions**. One transaction with integrity and quality checks, otherwise it rolls back. Every load is logged to `ops.load_log`. | `shopsense/warehouse/load.py`, `sql/warehouse/` |
+| Data quality | Lake checks on staged data: keys, nulls, accepted values, day-over-day volume, quarantine rate. Warehouse checks: freshness, completeness, SCD2 validity, revenue sanity, reconciliation. **Errors block publishing.** | `shopsense/quality/checks.py` |
+| Orchestration | Airflow 3 DAG `shopsense_daily` (sensor → ingest → clean → curate → load), with retries and backoff, catch-up backfills, and a `shopsense_reprocess` DAG for corrections | `airflow/` |
+| Monitoring | Dashboard tab for freshness, failing checks, quarantine trend, recent loads and Airflow runs, plus an incident runbook | `dashboard/app.py`, `docs/runbook.md` |
+| Redshift | Same schema with `DISTSTYLE ALL` dimensions, `DISTKEY(product_key)`, `SORTKEY(date_key)`, S3 `COPY`, and the incremental `DELETE`/`INSERT` pattern (reference, not yet run on AWS) | `sql/redshift/create_tables.sql` |
 
-The data model, lake zones and design decisions are in [`docs/data_model.md`](docs/data_model.md).
+Details: [data model](docs/data_model.md) · [performance](docs/performance.md) · [runbook](docs/runbook.md) · [Airflow](airflow/README.md)
 
 ## How the stockout answer is built
 
 `mart.restock_this_week` answers the question directly. For each product at each fulfillment center:
 
-1. **Demand estimate:** units sold in the last 28 days ÷ *days the FC actually had stock*. A product that was out of stock for half the window really sells twice as fast as its raw average suggests.
+1. **Demand estimate:** units sold in the last 28 days ÷ *days the FC actually had stock*. Stockout days would otherwise hide real demand.
 2. **Days of cover** = on hand ÷ daily demand, which gives a **projected stockout date**.
-3. **Risk tier:** *Out of stock* (0 on hand), *High* (< 7 days of cover), *Medium* (< 14), *Low*.
+3. **Risk tier:** *Out of stock*, *High* (< 7 days of cover), *Medium* (< 14), *Low*.
 4. **Action:** reorder enough to cover a 10-day lead time plus 21 days of demand, minus stock on hand and inbound. If stock is already inbound, the action is to expedite it instead.
-5. **Why:** `mart.demand_drivers` labels each product as *Promotion* (lift ≥ 1.3× while on promo), *Supply constrained* (≥ 20% of page views saw "out of stock"), *Rising / Falling demand* (±25% vs the prior 28 days, only with enough volume), or *Stable*.
+5. **Why:** `mart.demand_drivers` labels each product as *Promotion*, *Supply constrained*, *Rising / Falling demand* (only with enough volume), or *Stable*.
 
-## Results (seed 42, 180 days, 2,000 product × FC combinations)
+## Results (seed 42, 180 simulated days)
 
-**Data volume and quality**
+### Reliability: does incremental processing give the right answer?
+- **Incremental = full rebuild.** The lake was built up to day N−4, then 4 more days were processed one at a time. All **10 warehouse tables came out identical** to a full rebuild (row-by-row `EXCEPT ALL` in both directions). The comparison also caught a real bug: a non-deterministic `first()` picked a session's device differently between runs. It's now `min_by(…, event_ts)`.
+- **Small loads:** each incremental day replaced 1–3 date partitions for inventory, sessions and activity, and 12–16 for order lines, because status updates reach back to older orders.
+- **Backfills are idempotent:** reprocessing three already-loaded days changed **0 rows**.
+- **Quality gates work:** a truncated delivery (11 orders against a 186-order median) was **blocked before publishing**. The clean table was unchanged, and the date stayed unprocessed for the retry.
+- **Rollbacks work:** an error-level warehouse check rolls back the whole load and keeps the pending changes (tested).
+
+### Data volume and quality
 
 | Table | Raw rows | Clean rows | Quarantined | Duplicates removed |
 |---|---:|---:|---:|---:|
-| orders | 32,441 | 32,105 | 0 | 336 |
-| order_items | 55,197 | 54,550 | 104 | 543 |
-| clickstream | 1,023,234 | 1,002,452 | 875 | 19,907 |
+| orders | 32,492 | 32,147 | 0 | 345 |
+| order_status_updates | 64,551 | 63,893 | 0 | 658 |
+| order_items | 55,179 | 54,515 | 122 | 542 |
+| clickstream | 1,021,694 | 1,000,738 | 821 | 20,135 |
 | inventory_snapshots | 360,000 | 360,000 | 0 | 0 |
-| reviews | 3,480 | 3,468 | 12 | 0 |
+| catalog snapshots | 10,800 | 10,800 | 0 | 0 |
+| customer CDC | 6,751 | 6,751 | 0 | 0 |
+| reviews | 3,490 | 3,477 | 13 | 0 |
 
-- Every legacy-format timestamp (2% of orders) parsed, and every messy status and category was mapped to its canonical value.
-- **11,876 events arrived 1–2 days late**, and all of them were filed under the day they happened.
-- Reconciliation checks: warehouse net revenue matches the clean lake to the cent ($2,754,403.27), converted sessions equal clean orders, and there are 0 orphan keys.
+- **SCD Type 2:** 400 products became 1,064 versions, with 337 products repriced at least once. 703 customers have more than one version. **100% of order lines match the price of the product version valid on their order date.**
+- **11,783 late events** (1–2 days late) were filed under the day they happened.
+- **67 data-quality checks**, all passing on the final run.
+- Order lifecycle: 29,148 delivered, 1,394 returned, 692 shipped, 648 cancelled (excluded from revenue), 228 still placed. Net revenue is $2.70M, with $123k returned.
 
-**Business output (as of Jun 29, 2026)**
-- 56 product × FC combinations out of stock and 108 at high risk, putting **$4,182 a day of revenue** at risk.
-- Session conversion is 9.8%, and **10.5% of sessions hit an out-of-stock page**.
+### Business output (as of Jun 29, 2026)
+- 59 product × FC combinations out of stock and 112 at high risk, putting **$4,755 a day of revenue** at risk.
+- Session conversion is 9.8%, and 9.9% of sessions hit an out-of-stock page.
 
-**Backtest: is the High flag right?** On every Monday in the history I checked whether each product × FC flagged High actually stocked out within 7 days (21 weeks, 33,070 observations, 1,735 real stockouts).
+**Backtest of the High flag** (every Monday: did the product × FC actually stock out within 7 days?):
 
 | Demand estimate | Flagged | Caught | Precision | Recall |
 |---|---:|---:|---:|---:|
-| Stockout-adjusted (used) | 2,069 | 661 | 31.9% | **38.1%** |
-| Naive (units ÷ 28 days) | 1,814 | 615 | 33.9% | 35.4% |
+| Stockout-adjusted (used) | 2,163 | 641 | 29.6% | **39.4%** |
+| Naive (units ÷ 28 days) | 1,460 | 502 | 34.4% | 30.9% |
 
-The stockout adjustment catches more real stockouts (recall +2.7 points) at slightly lower precision. A rule this simple still misses most stockouts: demand per product and FC is only 1–2 units a day, so random variation is large, and the inventory feed doesn't say *when* inbound stock will arrive. This is a transparent baseline that the forecasting work in later stages has to beat.
+The stockout adjustment catches 28% more real stockouts (recall 39.4% vs 30.9%) at lower precision. A days-of-cover rule still misses most stockouts: demand per product and FC is 1–2 units a day, and the feed doesn't say when inbound stock arrives. This is a transparent baseline for later forecasting to beat.
 
-**Runtime and storage:** the full pipeline runs in about 2.5 minutes on a laptop (generate 58 s, clean 66 s, curate 17 s, warehouse load 1.5 s). The lake is 38 MB raw → 33 MB clean → 8.3 MB curated. Writing one file per date partition instead of Spark's default cut the clean zone from 51 MB to 33 MB and avoided hundreds of tiny files.
+### Performance ([details](docs/performance.md))
 
-![Demand drivers](docs/images/dashboard_drivers.png)
+| Experiment | Before | After |
+|---|---:|---:|
+| Raw gzip JSON → Parquet (daily views per product) | 0.488 s | **0.078 s** (6.3×) |
+| Partition pruning (one week of sessions) | 181 files / 22 MB | **7 files / 0.8 MB**, 4× faster |
+| Small files → one file per day | 0.054 s | **0.022 s** (2.5×) |
+| Materialize `mart.product_fc_daily` (21-date backtest) | 0.556 s | **0.342 s** (1.6×) |
+
+![Pipeline health](docs/images/dashboard_health.png)
+*The Airflow row comes from the `airflow dags test` run described in [airflow/README.md](airflow/README.md).*
 
 ## Setup
 
@@ -111,31 +142,28 @@ python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-On macOS, install Java with `brew install openjdk@21`.
+On macOS, install Java with `brew install openjdk@21`. To set up Airflow, see [airflow/README.md](airflow/README.md); it uses its own virtualenv.
 
 ## Run
 
 ```bash
-python -m shopsense.pipeline                 # generate → ingest → clean → curate → load → backtest
-streamlit run dashboard/app.py               # open http://localhost:8501
-pytest                                       # 21 tests, about 80 s
+python -m shopsense.pipeline                 # fresh run: generate → ingest → clean → curate → load → backtest
+python -m shopsense.pipeline --skip-generate # incremental: only new deliveries
+streamlit run dashboard/app.py               # http://localhost:8501
+pytest                                       # 33 tests, about 4.5 minutes
 ```
 
-Or one stage at a time:
+Individual steps:
 
 ```bash
-python -m shopsense.generate.retail_data     # landing files (--days, --seed)
-python -m shopsense.ingest.land_raw          # landing → raw (--date, --force)
-python -m shopsense.transform.clean          # raw → clean + quarantine
-python -m shopsense.transform.curate         # clean → star schema
-python -m shopsense.warehouse.load           # curated → warehouse + marts
-python -m shopsense.warehouse.backtest       # evaluate the stockout flag
-```
-
-Query the warehouse directly:
-
-```bash
-duckdb warehouse/shopsense.duckdb "SELECT * FROM mart.restock_this_week LIMIT 10"
+python -m shopsense.ingest.land_raw --date 2026-06-29 [--force]
+python -m shopsense.transform.clean                          # new deliveries only
+python -m shopsense.transform.clean --from 2026-03-01 --to 2026-03-07   # backfill (idempotent)
+python -m shopsense.transform.clean --full                   # rebuild the clean zone
+python -m shopsense.transform.curate
+python -m shopsense.warehouse.load [--full]                  # incremental by default
+python -m shopsense.warehouse.backtest
+python -m shopsense.warehouse.benchmark                      # performance experiments
 ```
 
 ## Project structure
@@ -143,27 +171,31 @@ duckdb warehouse/shopsense.duckdb "SELECT * FROM mart.restock_this_week LIMIT 10
 ```
 Shopsense-AI/
 ├── shopsense/
-│   ├── config.py                 # lake / warehouse paths (env-overridable)
-│   ├── pipeline.py               # end-to-end runner with step timings
-│   ├── generate/retail_data.py   # simulated retailer + dirty data
-│   ├── ingest/land_raw.py        # landing → raw, checksums, audit log
+│   ├── config.py                  # lake / warehouse paths (env-overridable)
+│   ├── pipeline.py                # one-command runner with step timings
+│   ├── generate/retail_data.py    # simulated retailer + change feeds + dirty data
+│   ├── ingest/land_raw.py         # landing → raw, checksums, audit log
 │   ├── transform/
-│   │   ├── spark.py              # SparkSession (local now, Glue later)
-│   │   ├── clean.py              # raw → clean + quarantine
-│   │   └── curate.py             # clean → star schema
+│   │   ├── spark.py               # SparkSession (local now, Glue later)
+│   │   ├── clean.py               # incremental raw → clean, write-audit-publish
+│   │   └── curate.py              # star schema, SCD Type 2
+│   ├── quality/checks.py          # lake + warehouse data-quality gates
 │   └── warehouse/
-│       ├── load.py               # DuckDB load + integrity checks
-│       └── backtest.py           # stockout flag vs what happened
+│       ├── load.py                # incremental / full load, integrity, ops log
+│       ├── backtest.py            # stockout flag vs what happened
+│       └── benchmark.py           # performance experiments
 ├── sql/
-│   ├── warehouse/ddl.sql         # warehouse tables (PKs enforced)
-│   ├── warehouse/marts.sql       # sales, funnel, inventory risk, drivers, restock
+│   ├── warehouse/ddl.sql          # dw, mart and ops schemas
+│   ├── warehouse/marts.sql        # sales, funnel, inventory risk, drivers, restock
 │   └── redshift/create_tables.sql
-├── dashboard/app.py              # Streamlit
-├── docs/                         # data model, screenshots
-└── tests/                        # unit + end-to-end tests
+├── airflow/dags/shopsense_daily.py
+├── dashboard/app.py               # Streamlit (4 tabs incl. pipeline health)
+├── docs/                          # data model, runbook, performance, screenshots
+└── tests/                         # unit, end-to-end, incremental-vs-full
 ```
 
 ## Notes and limitations
-- **Synthetic data:** the retailer is simulated, so the "right answer" is known. That's what makes the backtest possible.
-- **Local stand-ins for AWS:** the lake uses the S3 folder layout on local disk, Spark runs locally instead of on AWS Glue, and DuckDB plays the role of Redshift. Stage 2 adds real S3 (MinIO locally, AWS optionally) and runs the Redshift DDL.
-- **Lead time:** fixed at 10 days for the reorder recommendation, because the inventory feed doesn't carry supplier lead times.
+- **Synthetic data:** the retailer is simulated, so the right answer is known. That makes the backtest and the SCD2 price check possible.
+- **Local stand-ins for AWS:** the lake uses the S3 layout on local disk, Spark runs locally instead of on Glue, and DuckDB stands in for Redshift. The Redshift DDL is written but has not been run on AWS.
+- **Curated is rebuilt each run** (about 20 s here), while clean and the warehouse are incremental. At larger scale, curate would also process only the changed partitions.
+- **Lead time** is fixed at 10 days for the reorder recommendation, because the inventory feed doesn't carry supplier lead times.
