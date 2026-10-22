@@ -22,6 +22,8 @@ from pathlib import Path
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
+from shopsense import storage
+
 ERROR, WARN = "error", "warn"
 
 
@@ -51,10 +53,8 @@ def results_path(lake: Path) -> Path:
 
 def record(results: list[CheckResult], lake: Path) -> None:
     path = results_path(lake)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as fh:
-        for r in results:
-            fh.write(json.dumps(asdict(r)) + "\n")
+    if results:
+        storage.append_line(path, "\n".join(json.dumps(asdict(r)) for r in results))
 
 
 def raise_on_errors(results: list[CheckResult]) -> None:
@@ -114,7 +114,7 @@ def lake_checks(table: str, staged: DataFrame, key: list[str], target: Path, run
     pcol = VOLUME.get(table)
     if pcol and (target.exists() and any(target.glob(f"{pcol}=*"))):
         new_counts = {str(r[0]): r[1] for r in staged.groupBy(pcol).count().collect()}
-        history = staged.sparkSession.read.parquet(str(target)).filter(~F.col(pcol).isin(list(new_counts))) \
+        history = staged.sparkSession.read.parquet(storage.spark_uri(target)).filter(~F.col(pcol).isin(list(new_counts))) \
             .groupBy(pcol).count().orderBy(F.col(pcol).desc()).limit(14).collect()
         if len(history) >= 7:
             counts = sorted(r[1] for r in history)
@@ -205,5 +205,6 @@ def sync_to_warehouse(con, lake: Path) -> None:
     """Mirror the results log into ops.dq_results (rebuilt from the log each load)."""
     path = results_path(lake)
     if path.exists():
+        storage.register_duckdb(con, path)
         con.execute(f"CREATE OR REPLACE TABLE ops.dq_results AS "
                     f"SELECT * FROM read_json_auto('{path}', format='newline_delimited')")

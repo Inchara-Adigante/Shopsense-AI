@@ -35,6 +35,7 @@ from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 
 from shopsense.config import get_paths
+from shopsense.storage import spark_uri
 from shopsense.transform.spark import get_spark
 
 UNKNOWN_KEY = -1
@@ -275,7 +276,7 @@ def run(spark: SparkSession | None = None, lake: Path | None = None) -> dict[str
     clean, curated = lake / "clean", lake / "curated"
 
     def read(name: str) -> DataFrame:
-        return spark.read.parquet(str(clean / name))
+        return spark.read.parquet(spark_uri(clean / name))
 
     orders, items, inventory, events = read("orders"), read("order_items"), read("inventory_snapshots"), read("clickstream")
     products, customers, promotions, reviews = read("products"), read("customers"), read("promotions"), read("reviews")
@@ -289,8 +290,8 @@ def run(spark: SparkSession | None = None, lake: Path | None = None) -> dict[str
         "dim_promotion": build_dim_promotion(promotions),
     }
     for name, df in dims.items():
-        df.coalesce(1).write.mode("overwrite").parquet(str(curated / name))
-    d = {name: spark.read.parquet(str(curated / name)) for name in dims}
+        df.coalesce(1).write.mode("overwrite").parquet(spark_uri(curated / name))
+    d = {name: spark.read.parquet(spark_uri(curated / name)) for name in dims}
 
     facts = {
         "fact_order_item": build_fact_order_item(items, orders, d["dim_product"], d["dim_customer"],
@@ -301,9 +302,9 @@ def run(spark: SparkSession | None = None, lake: Path | None = None) -> dict[str
         "fact_review": build_fact_review(reviews, d["dim_product"], d["dim_customer"]),
     }
     for name, df in facts.items():
-        df.coalesce(2).write.mode("overwrite").parquet(str(curated / name))
+        df.coalesce(2).write.mode("overwrite").parquet(spark_uri(curated / name))
 
-    return {name: spark.read.parquet(str(curated / name)).count() for name in list(dims) + list(facts)}
+    return {name: spark.read.parquet(spark_uri(curated / name)).count() for name in list(dims) + list(facts)}
 
 
 def main() -> None:

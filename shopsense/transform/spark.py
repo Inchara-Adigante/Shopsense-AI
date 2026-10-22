@@ -8,13 +8,18 @@ import sys
 
 from pyspark.sql import SparkSession
 
+from shopsense import storage
+
 
 def get_spark(app_name: str = "shopsense") -> SparkSession:
     # Python workers must use the same interpreter (and venv) as the driver.
     os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
     os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
+    builder = SparkSession.builder
+    for key, value in storage.spark_s3_conf().items():          # s3a connector, only for an s3:// lake
+        builder = builder.config(key, value)
     return (
-        SparkSession.builder
+        builder
         .master(os.getenv("SPARK_MASTER", "local[*]"))
         .appName(app_name)
         .config("spark.sql.session.timeZone", "UTC")             # all timestamps are UTC

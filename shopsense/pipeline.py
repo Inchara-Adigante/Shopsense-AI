@@ -15,11 +15,11 @@ Usage:
 """
 import argparse
 import json
-import shutil
 import time
 from datetime import datetime, timezone
 
 from shopsense.ai import reviews as review_summaries
+from shopsense import storage
 from shopsense.config import get_paths
 from shopsense.generate.retail_data import generate
 from shopsense.ingest.land_raw import ingest
@@ -42,7 +42,7 @@ def run(skip_generate: bool = False, days: int | None = None) -> dict:
 
     if not skip_generate:
         # New simulated history -> start from an empty lake and warehouse.
-        shutil.rmtree(paths.lake, ignore_errors=True)
+        storage.rmtree(paths.lake)
         paths.warehouse_db.unlink(missing_ok=True)
         step("generate", lambda: generate(**({"n_days": days} if days else {})))
     step("ingest", lambda: {"batches": len(ingest())})

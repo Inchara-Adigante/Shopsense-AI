@@ -21,11 +21,11 @@ Usage:
 import argparse
 import hashlib
 import json
-import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
 from shopsense.config import SOURCES, get_paths
+from shopsense import storage
 
 
 class ChecksumMismatch(Exception):
@@ -55,13 +55,13 @@ def ingest_batch(source: str, batch_dir: Path, raw_root: Path, force: bool = Fal
             return {**manifest, "status": "skipped_duplicate"}
         if not force:
             raise ChecksumMismatch(f"{source} {ingest_date}: re-delivered with different content (use --force)")
-        shutil.rmtree(target)
+        storage.rmtree(target)
 
     target.mkdir(parents=True, exist_ok=True)
     for p in files:
-        shutil.copy2(p, target / p.name)
+        storage.copy_in(p, target / p.name)
     manifest["ingested_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    existing.write_text(json.dumps(manifest, indent=2))
+    storage.write_text_atomic(existing, json.dumps(manifest, indent=2))
     return {**manifest, "status": "ingested"}
 
 
@@ -83,10 +83,9 @@ def ingest(landing: Path | None = None, lake: Path | None = None, date: str | No
                 continue
             record = ingest_batch(source, batch, raw_root, force)
             results.append(record)
-            with audit.open("a") as fh:
-                fh.write(json.dumps({k: v for k, v in record.items() if k != "files"}
-                                    | {"n_files": len(record["files"]),
-                                       "bytes": sum(f["bytes"] for f in record["files"].values())}) + "\n")
+            storage.append_line(audit, json.dumps({k: v for k, v in record.items() if k != "files"}
+                                                  | {"n_files": len(record["files"]),
+                                                     "bytes": sum(f["bytes"] for f in record["files"].values())}))
     return results
 
 

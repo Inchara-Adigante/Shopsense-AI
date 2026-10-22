@@ -26,7 +26,6 @@ Usage:
 """
 import argparse
 import json
-import shutil
 from datetime import datetime, timezone
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -36,6 +35,8 @@ from pyspark.sql import Column, DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 
 from shopsense.config import get_paths
+from shopsense import storage
+from shopsense.storage import spark_uri
 from shopsense.transform.spark import get_spark
 
 CATEGORIES = ["Electronics", "Home & Kitchen", "Beauty", "Sports & Outdoors",
@@ -65,8 +66,8 @@ def raw_dates(raw: Path, source: str) -> list[str]:
 
 def read_raw(spark: SparkSession, raw: Path, source: str, fmt: str, dates: list[str] | None = None) -> DataFrame:
     base = raw / source
-    paths = [str(base / f"ingest_date={d}") for d in dates] if dates is not None else [str(base)]
-    reader = spark.read.option("basePath", str(base))      # keep ingest_date as a column
+    paths = [spark_uri(base / f"ingest_date={d}") for d in dates] if dates is not None else [spark_uri(base)]
+    reader = spark.read.option("basePath", spark_uri(base))      # keep ingest_date as a column
     if fmt == "csv":
         # Read everything as strings: type problems become quarantine reasons, not crashes.
         df = reader.option("header", True).option("inferSchema", False).csv(paths)
@@ -342,11 +343,7 @@ def load_state(lake: Path) -> dict[str, list[str]]:
 
 
 def save_state(lake: Path, state: dict[str, list[str]]) -> None:
-    path = _state_path(lake)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2))
-    tmp.replace(path)                                  # atomic: never a half-written state file
+    storage.write_text_atomic(_state_path(lake), json.dumps(state, indent=2))   # never a half-written state file
 
 
 def publish(name: str, result: CleanResult, lake: Path, audit: Audit | None = None) -> dict:
@@ -358,7 +355,7 @@ def publish(name: str, result: CleanResult, lake: Path, audit: Audit | None = No
     affected = sorted(str(r[0]) for r in new.select(pcol).distinct().collect()) if pcol else []
 
     if (target / "_SUCCESS").exists() or any(target.glob("*.parquet")) or any(target.glob(f"{pcol}=*")):
-        existing = spark.read.parquet(str(target))
+        existing = spark.read.parquet(spark_uri(target))
         if pcol:
             existing = existing.filter(F.col(pcol).isin(affected))
         merged = dedupe(new.unionByName(existing.withColumn("_source_file", F.lit("")), allowMissingColumns=True),
@@ -369,10 +366,10 @@ def publish(name: str, result: CleanResult, lake: Path, audit: Audit | None = No
 
     # 1. write: stage the merged rows (never read and overwrite the same files in one job).
     if pcol:
-        merged.repartition(pcol).write.mode("overwrite").partitionBy(pcol).parquet(str(staging))
+        merged.repartition(pcol).write.mode("overwrite").partitionBy(pcol).parquet(spark_uri(staging))
     else:
-        merged.coalesce(1).write.mode("overwrite").parquet(str(staging))
-    staged = spark.read.parquet(str(staging))
+        merged.coalesce(1).write.mode("overwrite").parquet(spark_uri(staging))
+    staged = spark.read.parquet(spark_uri(staging))
 
     # 2. audit: data-quality checks run on the staged data; an exception stops the publish.
     if audit:
@@ -380,23 +377,23 @@ def publish(name: str, result: CleanResult, lake: Path, audit: Audit | None = No
 
     # 3. publish: replace only the affected partitions (dynamic partition overwrite).
     if pcol:
-        staged.repartition(pcol).write.mode("overwrite").partitionBy(pcol).parquet(str(target))
+        staged.repartition(pcol).write.mode("overwrite").partitionBy(pcol).parquet(spark_uri(target))
     else:
-        staged.coalesce(1).write.mode("overwrite").parquet(str(target))
-    shutil.rmtree(staging, ignore_errors=True)
-    return {"affected_partitions": affected, "table_rows": spark.read.parquet(str(target)).count()}
+        staged.coalesce(1).write.mode("overwrite").parquet(spark_uri(target))
+    storage.rmtree(staging)
+    return {"affected_partitions": affected, "table_rows": spark.read.parquet(spark_uri(target)).count()}
 
 
 def write_quarantine(name: str, rejected: DataFrame, lake: Path) -> int:
     q = as_quarantine(rejected, name)
-    q.coalesce(1).write.mode("overwrite").partitionBy("ingest_date").parquet(str(lake / "quarantine" / name))
+    q.coalesce(1).write.mode("overwrite").partitionBy("ingest_date").parquet(spark_uri(lake / "quarantine" / name))
     return q.count()
 
 
 def build(name: str, raw: DataFrame, lake: Path) -> CleanResult:
     spark = raw.sparkSession
     if name == "order_items":
-        return clean_order_items(raw, spark.read.parquet(str(lake / "clean" / "orders")))
+        return clean_order_items(raw, spark.read.parquet(spark_uri(lake / "clean" / "orders")))
     return {
         "orders": clean_orders, "order_status_updates": clean_order_status, "products": clean_products,
         "customers": clean_customers, "promotions": clean_promotions, "inventory_snapshots": clean_inventory,
@@ -427,7 +424,7 @@ def run(spark: SparkSession | None = None, lake: Path | None = None, dates: list
     lake = lake or get_paths().lake
     if full:
         for zone in ("clean", "quarantine", "_staging"):
-            shutil.rmtree(lake / zone, ignore_errors=True)
+            storage.rmtree(lake / zone)
         _state_path(lake).unlink(missing_ok=True)
         pending_changes_path(lake).unlink(missing_ok=True)
     state, report = load_state(lake), RunReport()
@@ -455,9 +452,9 @@ def run(spark: SparkSession | None = None, lake: Path | None = None, dates: list
 
     # Orders whose status changed live in older order_date partitions - the warehouse must refresh them too.
     if "order_status_updates" in report.dates:
-        updated = spark.read.parquet(str(lake / "clean" / "order_status_updates")) \
+        updated = spark.read.parquet(spark_uri(lake / "clean" / "order_status_updates")) \
             .filter(F.col("ingest_date").isin(report.dates["order_status_updates"])).select("order_id")
-        days = spark.read.parquet(str(lake / "clean" / "orders")).join(updated, "order_id") \
+        days = spark.read.parquet(spark_uri(lake / "clean" / "orders")).join(updated, "order_id") \
             .select("order_date").distinct().collect()
         report.tables["order_status_updates"]["affected_order_dates"] = sorted(str(r[0]) for r in days)
 
@@ -468,10 +465,8 @@ def run(spark: SparkSession | None = None, lake: Path | None = None, dates: list
         checks.raise_on_errors(rate)
     record_pending_changes(lake, report)
     audit_file = lake / "_audit" / "clean_runs.jsonl"
-    audit_file.parent.mkdir(parents=True, exist_ok=True)
-    with audit_file.open("a") as fh:
-        fh.write(json.dumps({"tables": {k: {kk: vv for kk, vv in v.items() if kk != "affected_partitions"}
-                                        for k, v in report.tables.items()}}) + "\n")
+    storage.append_line(audit_file, json.dumps({"tables": {k: {kk: vv for kk, vv in v.items() if kk != "affected_partitions"}
+                                                           for k, v in report.tables.items()}}))
     return report
 
 
@@ -492,10 +487,7 @@ def record_pending_changes(lake: Path, report: RunReport) -> None:
         pending[table] = sorted(set(pending.get(table, [])) | dates) if dates else pending.get(table, [])
         pending.setdefault("_changed_tables", [])
         pending["_changed_tables"] = sorted(set(pending["_changed_tables"]) | {table})
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(pending, indent=2))
-    tmp.replace(path)
+    storage.write_text_atomic(path, json.dumps(pending, indent=2))
 
 
 def main() -> None:

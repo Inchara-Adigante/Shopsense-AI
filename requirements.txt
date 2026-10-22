@@ -1,4 +1,4 @@
-# Stage 1: core platform (pinned to the versions tested)
+# Runtime dependencies (pinned to the versions tested)
 pyspark==4.2.0          # needs Java 17 or 21
 duckdb==2.0.0           # local columnar warehouse (stand-in for Amazon Redshift)
 pandas>=2.2,<3          # PySpark does not fully support pandas 3 yet
@@ -6,4 +6,7 @@ pyarrow==26.0.0
 numpy==2.3.5
 streamlit==1.66.1
 pytest==9.1.1
+universal-pathlib==0.3.10  # pathlib API for s3:// lakes
+s3fs==2026.9.0             # S3 filesystem for the lake and DuckDB reads
+boto3==1.43.106
 anthropic==2.1.0         # Claude API (assistant + review summaries; optional - offline mode needs no key)

@@ -37,6 +37,7 @@ from pathlib import Path
 import duckdb
 
 from shopsense.config import ROOT, get_paths
+from shopsense import storage
 from shopsense.quality import checks
 
 DDL = ROOT / "sql" / "warehouse" / "ddl.sql"
@@ -125,6 +126,7 @@ def load(lake: Path | None = None, db_path: Path | None = None, full: bool = Fal
     run_id = uuid.uuid4().hex[:12]
 
     con = connect(db_path)
+    storage.register_duckdb(con, curated)              # s3:// lakes are read through fsspec
     try:
         empty = not con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'dw'").fetchone()[0]
         mode = "full" if (full or empty) else "incremental"

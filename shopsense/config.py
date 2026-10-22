@@ -15,6 +15,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from shopsense.storage import lake_path
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -44,7 +46,7 @@ class Paths:
 def get_paths() -> Paths:
     return Paths(
         landing=Path(os.getenv("SHOPSENSE_LANDING", ROOT / "data" / "landing")),
-        lake=Path(os.getenv("SHOPSENSE_LAKE", ROOT / "lake")),
+        lake=lake_path(os.getenv("SHOPSENSE_LAKE", ROOT / "lake")),       # local path or s3://bucket/prefix
         warehouse_db=Path(os.getenv("SHOPSENSE_WAREHOUSE", ROOT / "warehouse" / "shopsense.duckdb")),
     )
 
