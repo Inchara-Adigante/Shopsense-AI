@@ -20,8 +20,9 @@ Two modes
                      step reports those dates so the affected rows are refreshed.
 
 Both modes run in one transaction with integrity checks (no orphan foreign keys,
-row counts equal to the lake); on any failure everything rolls back and the
-pending-changes file is kept for the retry. Each table load is logged to ops.load_log.
+row counts equal to the lake) and the warehouse data-quality checks
+(shopsense/quality/checks.py); on an error-level failure everything rolls back and
+the pending-changes file is kept for the retry. Each table load is logged to ops.load_log.
 
 Usage:
     python -m shopsense.warehouse.load            # incremental (full if the warehouse is empty)
@@ -36,6 +37,7 @@ from pathlib import Path
 import duckdb
 
 from shopsense.config import ROOT, get_paths
+from shopsense.quality import checks
 
 DDL = ROOT / "sql" / "warehouse" / "ddl.sql"
 MARTS = ROOT / "sql" / "warehouse" / "marts.sql"
@@ -115,7 +117,7 @@ def _log(con, run_id, table, mode, partitions, deleted, inserted):
                 [run_id, datetime.now(timezone.utc).replace(tzinfo=None), table, mode, partitions, deleted, inserted])
 
 
-def load(lake: Path | None = None, db_path: Path | None = None, full: bool = False) -> dict:
+def load(lake: Path | None = None, db_path: Path | None = None, full: bool = False, quality: bool = True) -> dict:
     lake = lake or get_paths().lake
     curated = lake / "curated"
     pend_file = pending_path(lake)
@@ -169,6 +171,11 @@ def load(lake: Path | None = None, db_path: Path | None = None, full: bool = Fal
 
         expected = {t: con.execute(f"SELECT COUNT(*) FROM {_source(curated, t)}").fetchone()[0] for t in TABLES}
         check_integrity(con, expected)
+        if quality:
+            dq = checks.warehouse_checks(con, run_id)
+            checks.record(dq, lake)
+            checks.raise_on_errors(dq)                 # error-level failure -> ROLLBACK below
+        checks.sync_to_warehouse(con, lake)
         con.execute(MARTS.read_text())
         con.execute("COMMIT")
     except Exception:

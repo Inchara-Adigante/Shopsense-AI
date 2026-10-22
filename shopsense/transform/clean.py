@@ -27,6 +27,7 @@ Usage:
 import argparse
 import json
 import shutil
+from datetime import datetime, timezone
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -319,7 +320,7 @@ TABLES = {
     "reviews": "json",
 }
 
-Audit = Callable[[str, DataFrame], None]
+Audit = Callable[[str, DataFrame, list[str], Path], None]      # (table, staged rows, key, published path)
 
 
 @dataclass
@@ -375,7 +376,7 @@ def publish(name: str, result: CleanResult, lake: Path, audit: Audit | None = No
 
     # 2. audit: data-quality checks run on the staged data; an exception stops the publish.
     if audit:
-        audit(name, staged)
+        audit(name, staged, result.key, target)
 
     # 3. publish: replace only the affected partitions (dynamic partition overwrite).
     if pcol:
@@ -403,8 +404,20 @@ def build(name: str, raw: DataFrame, lake: Path) -> CleanResult:
     }[name](raw)
 
 
+def default_audit(lake: Path, run_id: str) -> Audit:
+    """Data-quality checks on staged data; errors raise and block the publish."""
+    from shopsense.quality import checks
+
+    def audit(name: str, staged: DataFrame, key: list[str], target: Path) -> None:
+        results = checks.lake_checks(name, staged, key, target, run_id)
+        checks.record(results, lake)
+        checks.raise_on_errors(results)
+    return audit
+
+
 def run(spark: SparkSession | None = None, lake: Path | None = None, dates: list[str] | None = None,
-        full: bool = False, audit: Audit | None = None) -> RunReport:
+        full: bool = False, audit: Audit | None = None, run_id: str | None = None,
+        quality: bool = True) -> RunReport:
     """
     dates=None, full=False : process every raw delivery not processed yet (normal daily run)
     dates=[...]            : (re)process exactly these ingest dates (backfill)
@@ -418,6 +431,9 @@ def run(spark: SparkSession | None = None, lake: Path | None = None, dates: list
         _state_path(lake).unlink(missing_ok=True)
         pending_changes_path(lake).unlink(missing_ok=True)
     state, report = load_state(lake), RunReport()
+    run_id = run_id or datetime.now(timezone.utc).strftime("clean-%Y%m%dT%H%M%S")
+    if audit is None and quality:
+        audit = default_audit(lake, run_id)
 
     for name, fmt in TABLES.items():
         available = raw_dates(lake / "raw", name)
@@ -445,6 +461,11 @@ def run(spark: SparkSession | None = None, lake: Path | None = None, dates: list
             .select("order_date").distinct().collect()
         report.tables["order_status_updates"]["affected_order_dates"] = sorted(str(r[0]) for r in days)
 
+    if quality and report.tables:
+        from shopsense.quality import checks
+        rate = checks.quarantine_rate_checks(report.tables, run_id)
+        checks.record(rate, lake)
+        checks.raise_on_errors(rate)
     record_pending_changes(lake, report)
     audit_file = lake / "_audit" / "clean_runs.jsonl"
     audit_file.parent.mkdir(parents=True, exist_ok=True)
