@@ -12,8 +12,8 @@ An end-to-end retail data platform that turns orders, customer activity, invento
 |---|---|---|
 | **1. Core platform** | Retail data → S3-style lake → PySpark transformations → star-schema warehouse → dashboard | ✅ Done |
 | **2. Production reliability** | Incremental loads and backfills, SCD Type 2, data-quality gates, Airflow orchestration, monitoring, runbook, performance evidence | ✅ Done |
-| 3. Streaming | Simulated live orders and clicks, deduplication, late-event handling with watermarks | Next |
-| 4. AI | Review summaries and a business assistant that cites the metrics behind its answers | Planned |
+| **3. Streaming** | Live orders and clicks with late, too-late and duplicate deliveries; Spark Structured Streaming with watermark, dedup and an exactly-once sink; live stock alerts | ✅ Done |
+| 4. AI | Review summaries and a business assistant that cites the metrics behind its answers | Next |
 | AWS deployment | Real S3 (MinIO locally), Glue jobs, Redshift Serverless | Planned. Today these are local stand-ins (see [Notes](#notes-and-limitations)). |
 
 ## Architecture
@@ -67,7 +67,9 @@ flowchart LR
 | Monitoring | Dashboard tab for freshness, failing checks, quarantine trend, recent loads and Airflow runs, plus an incident runbook | `dashboard/app.py`, `docs/runbook.md` |
 | Redshift | Same schema with `DISTSTYLE ALL` dimensions, `DISTKEY(product_key)`, `SORTKEY(date_key)`, S3 `COPY`, and the incremental `DELETE`/`INSERT` pattern (reference, not yet run on AWS) | `sql/redshift/create_tables.sql` |
 
-Details: [data model](docs/data_model.md) · [performance](docs/performance.md) · [runbook](docs/runbook.md) · [Airflow](airflow/README.md)
+| Streaming | A producer replays a day as a messy live stream. Spark Structured Streaming applies a 10-minute watermark and `dropDuplicatesWithinWatermark`, then `foreachBatch` → `INSERT OR IGNORE` (exactly-once with checkpoints). Live views compute 5-minute activity, units sold and stock right now, with alerts. | `shopsense/streaming/`, `sql/live/live.sql` |
+
+Details: [data model](docs/data_model.md) · [streaming](docs/streaming.md) · [performance](docs/performance.md) · [runbook](docs/runbook.md) · [Airflow](airflow/README.md)
 
 ## How the stockout answer is built
 
@@ -119,6 +121,14 @@ Details: [data model](docs/data_model.md) · [performance](docs/performance.md) 
 
 The stockout adjustment catches 28% more real stockouts (recall 39.4% vs 30.9%) at lower precision. A days-of-cover rule still misses most stockouts: demand per product and FC is 1–2 units a day, and the feed doesn't say when inbound stock arrives. This is a transparent baseline for later forecasting to beat.
 
+### Streaming ([details](docs/streaming.md))
+Replaying Jun 29 (5,626 click events and 289 order lines, sent as 6,080 deliveries with retries and late events):
+- **0 on-time or within-watermark events lost and 0 counted twice**, in a single run, across a mid-day restart with re-sent files, and after **killing the live job mid-stream** and resuming from its checkpoint.
+- **29 of 29 too-late events dropped** in a single run (28 of 29 after a restart; why that's expected is explained in the doc).
+- The job keeps up with a stream at up to 60× real time with the default micro-batch size.
+
+![Live tab](docs/images/dashboard_live.png)
+
 ### Performance ([details](docs/performance.md))
 
 | Experiment | Before | After |
@@ -150,7 +160,11 @@ On macOS, install Java with `brew install openjdk@21`. To set up Airflow, see [a
 python -m shopsense.pipeline                 # fresh run: generate → ingest → clean → curate → load → backtest
 python -m shopsense.pipeline --skip-generate # incremental: only new deliveries
 streamlit run dashboard/app.py               # http://localhost:8501
-pytest                                       # 33 tests, about 4.5 minutes
+pytest                                       # 37 tests, about 6.5 minutes
+
+# streaming (see docs/streaming.md)
+python -m shopsense.streaming.producer --day 2026-06-29 --speed 60    # live replay
+python -m shopsense.streaming.stream_job --day 2026-06-29 --continuous --reset
 ```
 
 Individual steps:
@@ -180,6 +194,9 @@ Shopsense-AI/
 │   │   ├── clean.py               # incremental raw → clean, write-audit-publish
 │   │   └── curate.py              # star schema, SCD Type 2
 │   ├── quality/checks.py          # lake + warehouse data-quality gates
+│   ├── streaming/
+│   │   ├── producer.py            # messy live replay (late, too-late, duplicates)
+│   │   └── stream_job.py          # Structured Streaming → exactly-once live tables
 │   └── warehouse/
 │       ├── load.py                # incremental / full load, integrity, ops log
 │       ├── backtest.py            # stockout flag vs what happened
@@ -187,15 +204,16 @@ Shopsense-AI/
 ├── sql/
 │   ├── warehouse/ddl.sql          # dw, mart and ops schemas
 │   ├── warehouse/marts.sql        # sales, funnel, inventory risk, drivers, restock
+│   ├── live/live.sql              # live tables + 5-minute / stock views
 │   └── redshift/create_tables.sql
 ├── airflow/dags/shopsense_daily.py
-├── dashboard/app.py               # Streamlit (4 tabs incl. pipeline health)
+├── dashboard/app.py               # Streamlit: live, restock, drivers, sales, pipeline health
 ├── docs/                          # data model, runbook, performance, screenshots
 └── tests/                         # unit, end-to-end, incremental-vs-full
 ```
 
 ## Notes and limitations
 - **Synthetic data:** the retailer is simulated, so the right answer is known. That makes the backtest and the SCD2 price check possible.
-- **Local stand-ins for AWS:** the lake uses the S3 layout on local disk, Spark runs locally instead of on Glue, and DuckDB stands in for Redshift. The Redshift DDL is written but has not been run on AWS.
+- **Local stand-ins for AWS:** the lake uses the S3 layout on local disk, Spark runs locally instead of on Glue, DuckDB stands in for Redshift, and file-based topics stand in for Kinesis or Kafka (the mapping is in docs/streaming.md). The Redshift DDL is written but has not been run on AWS.
 - **Curated is rebuilt each run** (about 20 s here), while clean and the warehouse are incremental. At larger scale, curate would also process only the changed partitions.
 - **Lead time** is fixed at 10 days for the reorder recommendation, because the inventory feed doesn't carry supplier lead times.
