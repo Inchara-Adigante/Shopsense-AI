@@ -43,7 +43,9 @@ GROUP BY d.date;
 
 -- ---------------------------------------------------------------- product x FC x day base
 -- Units sold and stock position on the same grain - the base for demand and risk.
-CREATE OR REPLACE VIEW mart.product_fc_daily AS
+-- Materialized as a table (rebuilt on every load): the risk macro and the backtest read it
+-- many times, and materializing halved the backtest runtime (docs/performance.md).
+CREATE OR REPLACE TABLE mart.product_fc_daily AS
 SELECT i.date_key, d.date, i.product_key, i.fc_key,
        i.on_hand_units, i.inbound_units, i.is_stockout,
        COALESCE(s.units, 0)       AS units_sold,

@@ -1,0 +1,50 @@
+{
+  "file_format": {
+    "question": "daily page views per product (1M events)",
+    "raw_json_gz": {
+      "seconds": 0.488,
+      "files": 181,
+      "mb": 13.4
+    },
+    "clean_parquet": {
+      "seconds": 0.078,
+      "files": 181,
+      "mb": 22.0
+    }
+  },
+  "partition_pruning": {
+    "question": "distinct sessions in one week (Jun 1-7)",
+    "partition_filter": {
+      "seconds": 0.008,
+      "files_read": 7,
+      "mb": 0.8
+    },
+    "non_partition_filter": {
+      "seconds": 0.034,
+      "files_read": 181,
+      "mb": 22.0
+    }
+  },
+  "small_files": {
+    "question": "event counts by type over all 1M events",
+    "many_small_files": {
+      "seconds": 0.054,
+      "files": 655,
+      "mb": 23.6
+    },
+    "one_file_per_day": {
+      "seconds": 0.022,
+      "files": 181,
+      "mb": 22.0
+    }
+  },
+  "materialization": {
+    "question": "stockout backtest (21 as-of dates)",
+    "view": {
+      "seconds": 0.556
+    },
+    "materialized_table": {
+      "seconds": 0.342
+    }
+  }
+}
