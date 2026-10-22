@@ -77,29 +77,36 @@ def schedule(events: pd.DataFrame, rng: np.random.Generator) -> tuple[pd.DataFra
     return sent, events.loc[too_late, "event_id"].tolist()
 
 
-def write_topic(topic: str, sent: pd.DataFrame, out_dir: Path, speed: float | None) -> int:
-    """One JSON-lines file per minute of arrival time, written atomically (tmp file + rename)."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    sent = sent.assign(minute=sent["arrival_ts"].dt.floor("min"))
-    n_files, start_wall, start_sim = 0, time.time(), sent["arrival_ts"].min()
-    for minute, batch in sent.groupby("minute"):
+def write_files(topics: dict[str, pd.DataFrame], root: Path, speed: float | None) -> dict[str, int]:
+    """
+    One JSON-lines file per topic per minute of arrival time, written atomically (tmp file + rename).
+    All topics are interleaved by arrival time, so in live mode they stream side by side.
+    """
+    batches = []
+    for topic, sent in topics.items():
+        (root / topic).mkdir(parents=True, exist_ok=True)
+        for minute, batch in sent.assign(minute=sent["arrival_ts"].dt.floor("min")).groupby("minute"):
+            batches.append((minute, topic, batch.drop(columns="minute")))
+    batches.sort(key=lambda b: (b[0], b[1]))
+    n_files = {t: 0 for t in topics}
+    start_wall, start_sim = time.time(), batches[0][0] if batches else None
+    for minute, topic, batch in batches:
         if speed:                                                    # live mode: wait for the simulated clock
             due = start_wall + (minute - start_sim).total_seconds() / speed
             time.sleep(max(0.0, due - time.time()))
-        body = batch.drop(columns="minute").assign(
-            event_ts=batch["event_ts"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-            arrival_ts=batch["arrival_ts"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
+        body = batch.assign(event_ts=batch["event_ts"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                            arrival_ts=batch["arrival_ts"].dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ"))
         name = f"part-{minute:%Y%m%d%H%M}"
-        tmp = out_dir / f".{name}.tmp"                               # Spark ignores dot-files
+        tmp = root / topic / f".{name}.tmp"                          # Spark ignores dot-files
         body.to_json(tmp, orient="records", lines=True)
-        final = out_dir / f"{name}.json"
+        final = root / topic / f"{name}.json"
         tmp.rename(final)
         # Spark's file source orders new files by modification time (ms precision). Stamp each file with
         # its arrival minute so files are strictly ordered even when written in a burst - the ordering
         # guarantee Kafka/Kinesis give through offsets.
         epoch = minute.tz_localize("UTC").timestamp() if minute.tzinfo is None else minute.timestamp()
         os.utime(final, (epoch, epoch))
-        n_files += 1
+        n_files[topic] += 1
     return n_files
 
 
@@ -110,15 +117,20 @@ def produce(day: str, lake: Path | None = None, root: Path | None = None, speed:
         shutil.rmtree(root / sub, ignore_errors=True)
     rng = np.random.default_rng(seed)
     data = load_day(day, lake)
-    summary = {"day": day}
+    summary, sent_by_topic, truths = {"day": day}, {}, {}
     for topic, events in data.items():
         sent, too_late = schedule(events, rng)
-        files = write_topic(topic, sent, root / topic, speed)
-        truth = {"unique_events": len(events), "sent": len(sent), "duplicates_sent": len(sent) - len(events),
-                 "too_late_event_ids": too_late, "files": files}
-        (root / "_truth").mkdir(parents=True, exist_ok=True)
+        sent_by_topic[topic] = sent
+        truths[topic] = {"unique_events": len(events), "sent": len(sent), "duplicates_sent": len(sent) - len(events),
+                         "too_late_event_ids": too_late}
+    # Truth first: a test (or the dashboard) can compare against it while a live replay is still running.
+    (root / "_truth").mkdir(parents=True, exist_ok=True)
+    for topic, truth in truths.items():
         (root / "_truth" / f"{topic}.json").write_text(json.dumps(truth))
-        summary[topic] = {k: v for k, v in truth.items() if k != "too_late_event_ids"} | {"too_late": len(too_late)}
+    files = write_files(sent_by_topic, root, speed)
+    for topic, truth in truths.items():
+        summary[topic] = {k: v for k, v in truth.items() if k != "too_late_event_ids"} | {
+            "too_late": len(truth["too_late_event_ids"]), "files": files[topic]}
     return summary
 
 

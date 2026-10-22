@@ -30,6 +30,7 @@ import json
 import os
 import shutil
 import threading
+import time
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -60,6 +61,17 @@ def live_db_path() -> Path:
     return Path(os.getenv("SHOPSENSE_LIVE_DB", get_paths().warehouse_db.with_name("streaming.duckdb")))
 
 
+def connect_with_retry(db: Path, read_only: bool = False, attempts: int = 50, wait_s: float = 0.1):
+    """DuckDB allows one writer process or many readers; wait briefly for the other side to finish."""
+    for i in range(attempts):
+        try:
+            return duckdb.connect(str(db), read_only=read_only)
+        except duckdb.IOException:
+            if i == attempts - 1:
+                raise
+            time.sleep(wait_s)
+
+
 def init_live_db(day: str, db: Path, warehouse: Path) -> None:
     """Create live tables and snapshot start-of-day stock + demand from the warehouse."""
     con = duckdb.connect(str(db))
@@ -85,10 +97,12 @@ def make_sink(topic: str, db: Path):
         if rows.empty:
             return
         with _db_lock:
-            con = duckdb.connect(str(db))
-            con.register("incoming", rows)
-            con.execute(f"INSERT OR IGNORE INTO {table} BY NAME SELECT *, now() AS ingested_at FROM incoming")
-            con.close()
+            con = connect_with_retry(db)              # the dashboard may be reading the file right now
+            try:
+                con.register("incoming", rows)
+                con.execute(f"INSERT OR IGNORE INTO {table} BY NAME SELECT *, now() AS ingested_at FROM incoming")
+            finally:
+                con.close()
     return sink
 
 
@@ -115,6 +129,7 @@ def log_progress(queries, path: Path) -> list[dict]:
 
 
 def start(spark: SparkSession, topic: str, root: Path, db: Path, checkpoints: Path, continuous: bool):
+    (root / topic).mkdir(parents=True, exist_ok=True)        # the topic may not have received a file yet
     events = (spark.readStream.schema(SCHEMAS[topic])
               .option("timestampFormat", TS_FORMAT)
               .option("maxFilesPerTrigger", 5)                 # ~5 simulated minutes per micro-batch

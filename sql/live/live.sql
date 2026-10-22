@@ -75,10 +75,17 @@ SELECT s.product_id, s.product_name, s.category, s.fc_id, s.start_on_hand, s.inb
        s.daily_demand,
        ROUND(GREATEST(s.start_on_hand - COALESCE(sold.units_today, 0), 0) / NULLIF(s.daily_demand / 24.0, 0), 1)
                                                                               AS hours_of_cover,
-       CASE WHEN s.start_on_hand - COALESCE(sold.units_today, 0) <= 0 THEN 'Sold out today'
+       CASE WHEN COALESCE(sold.units_today, 0) > s.start_on_hand THEN 'Restock arrived'   -- sold more than it opened with
+            WHEN s.start_on_hand = 0 THEN 'Out of stock since open'
+            WHEN s.start_on_hand - COALESCE(sold.units_today, 0) <= 0 THEN 'Sold out today'
             WHEN (s.start_on_hand - COALESCE(sold.units_today, 0)) / NULLIF(s.daily_demand / 24.0, 0) < 12
                  THEN 'Under 12h of cover'
             ELSE 'OK' END                                                     AS live_alert,
+       CASE WHEN COALESCE(sold.units_today, 0) > s.start_on_hand THEN 4
+            WHEN s.start_on_hand = 0 THEN 3
+            WHEN s.start_on_hand - COALESCE(sold.units_today, 0) <= 0 THEN 1
+            WHEN (s.start_on_hand - COALESCE(sold.units_today, 0)) / NULLIF(s.daily_demand / 24.0, 0) < 12 THEN 2
+            ELSE 9 END                                                        AS alert_rank,      -- 1 = act first
        sold.last_sale_ts
 FROM live.start_of_day s
 LEFT JOIN sold USING (product_id, fc_id);
