@@ -1,5 +1,7 @@
 # ShopSense AI | Retail Intelligence and Real-Time Data Platform
 
+[![CI](https://github.com/Inchara-Adigante/Shopsense-AI/actions/workflows/ci.yml/badge.svg)](https://github.com/Inchara-Adigante/Shopsense-AI/actions/workflows/ci.yml)
+
 An end-to-end retail data platform that turns orders, customer activity, inventory and product reviews into reliable business insights.
 
 **Business question:** *Which products are likely to run out of stock, what is driving their demand, and what action should the business take?*
@@ -14,7 +16,7 @@ An end-to-end retail data platform that turns orders, customer activity, invento
 | **2. Production reliability** | Incremental loads and backfills, SCD Type 2, data-quality gates, Airflow orchestration, monitoring, runbook, performance evidence | ✅ Done |
 | **3. Streaming** | Live orders and clicks with late, too-late and duplicate deliveries; Spark Structured Streaming with watermark, dedup and an exactly-once sink; live stock alerts | ✅ Done |
 | **4. AI** | A business assistant that answers from the warehouse through read-only tools, cites the rows behind every number, and has a number-level grounding check; per-product review summaries | ✅ Done |
-| AWS deployment | Real S3 (MinIO locally), Glue jobs, Redshift Serverless | Planned. Today these are local stand-ins (see [Notes](#notes-and-limitations)). |
+| **5. AWS deployment** | Lake on S3 through one storage layer, Glue 5.0 jobs, Athena, optional Redshift Serverless, budget alert, all in Terraform; CI | ✅ Infrastructure as code, tested on an AWS emulator. Not yet run on a real AWS account (see [infra/](infra/README.md)). |
 
 ## Architecture
 
@@ -70,7 +72,9 @@ flowchart LR
 | AI | Five read-only SQL tools with citation refs. A Claude (`claude-opus-5-5`) tool-use loop with strict schemas, a cached system prompt and refusal fallbacks, or an offline keyword router when no API key is set. A grounding check rejects any number not found in a tool result. Review summaries use SQL numbers, with extractive or Claude Batches text. | `shopsense/ai/` |
 | Streaming | A producer replays a day as a messy live stream. Spark Structured Streaming applies a 10-minute watermark and `dropDuplicatesWithinWatermark`, then `foreachBatch` → `INSERT OR IGNORE` (exactly-once with checkpoints). Live views compute 5-minute activity, units sold and stock right now, with alerts. | `shopsense/streaming/`, `sql/live/live.sql` |
 
-Details: [data model](docs/data_model.md) · [AI](docs/ai.md) · [streaming](docs/streaming.md) · [performance](docs/performance.md) · [runbook](docs/runbook.md) · [Airflow](airflow/README.md)
+| AWS | `SHOPSENSE_LAKE=s3://…` runs the same pipeline on S3 (Spark via S3A, DuckDB via fsspec). Terraform for S3 (versioning, encryption, lifecycle), least-privilege IAM, Glue jobs and workflow, Athena, Redshift Serverless with a usage limit, and a $5 budget alert | `shopsense/storage.py`, `infra/` |
+
+Details: [project report](docs/report.md) · [AWS deployment](infra/README.md) · [data model](docs/data_model.md) · [AI](docs/ai.md) · [streaming](docs/streaming.md) · [performance](docs/performance.md) · [runbook](docs/runbook.md) · [Airflow](airflow/README.md)
 
 ## How the stockout answer is built
 
@@ -128,6 +132,11 @@ Replaying Jun 29 (5,626 click events and 289 order lines, sent as 6,080 deliveri
 - **29 of 29 too-late events dropped** in a single run (28 of 29 after a restart; why that's expected is explained in the doc).
 - The job keeps up with a stream at up to 60× real time with the default micro-batch size.
 
+### AWS ([details](infra/README.md))
+- **S3 lake = local lake:** the full pipeline with `SHOPSENSE_LAKE=s3://…`, against a local S3-compatible server, gives a warehouse **identical** to the local-disk run (0 differences across 11 tables).
+- **Terraform:** `terraform validate` passes in CI, and `terraform apply` against an AWS emulator created 22 of 23 resources (S3, IAM, Glue jobs, workflow and triggers, Athena). The emulator doesn't support the AWS-managed Glue policy, Budgets or Redshift Serverless, so those were left out of that test.
+- The clean step is compatible with Glue 5.0 (Spark 3.5).
+
 ![Live tab](docs/images/dashboard_live.png)
 
 ### AI assistant ([details](docs/ai.md))
@@ -169,7 +178,10 @@ On macOS, install Java with `brew install openjdk@21`. To set up Airflow, see [a
 python -m shopsense.pipeline                 # fresh run: generate → ingest → clean → curate → load → backtest
 python -m shopsense.pipeline --skip-generate # incremental: only new deliveries
 streamlit run dashboard/app.py               # http://localhost:8501
-pytest                                       # 50 tests, about 6.5 minutes
+pytest                                       # 50 tests, about 6.5 minutes (SHOPSENSE_S3_TESTS=1 adds the S3 test)
+
+# the same pipeline with the lake in S3 (any S3-compatible endpoint, or real AWS)
+SHOPSENSE_LAKE=s3://my-bucket/lake python -m shopsense.pipeline
 
 # AI (see docs/ai.md) - uses Claude when ANTHROPIC_API_KEY is set, otherwise offline mode
 python -m shopsense.ai.assistant "Which products need restocking this week in Boston?"
@@ -198,11 +210,12 @@ python -m shopsense.warehouse.benchmark                      # performance exper
 Shopsense-AI/
 ├── shopsense/
 │   ├── config.py                  # lake / warehouse paths (env-overridable)
+│   ├── storage.py                 # local disk or s3:// with one API
 │   ├── pipeline.py                # one-command runner with step timings
 │   ├── generate/retail_data.py    # simulated retailer + change feeds + dirty data
 │   ├── ingest/land_raw.py         # landing → raw, checksums, audit log
 │   ├── transform/
-│   │   ├── spark.py               # SparkSession (local now, Glue later)
+│   │   ├── spark.py               # SparkSession (local, S3A, or Glue)
 │   │   ├── clean.py               # incremental raw → clean, write-audit-publish
 │   │   └── curate.py              # star schema, SCD Type 2
 │   ├── quality/checks.py          # lake + warehouse data-quality gates
@@ -225,13 +238,17 @@ Shopsense-AI/
 │   └── redshift/create_tables.sql
 ├── airflow/dags/shopsense_daily.py
 ├── dashboard/app.py               # Streamlit: ask, live, restock, drivers, sales, pipeline health
-├── docs/                          # data model, runbook, performance, screenshots
+├── infra/
+│   ├── glue/shopsense_job.py      # Glue job entry point (clean / curate)
+│   └── terraform/                 # S3, IAM, Glue, Athena, Redshift Serverless, budget
+├── .github/workflows/ci.yml       # tests, terraform validate, wheel build
+├── docs/                          # report, data model, runbook, performance, screenshots
 └── tests/                         # unit, end-to-end, incremental-vs-full
 ```
 
 ## Notes and limitations
 - **Synthetic data:** the retailer is simulated, so the right answer is known. That makes the backtest and the SCD2 price check possible.
-- **Local stand-ins for AWS:** the lake uses the S3 layout on local disk, Spark runs locally instead of on Glue, DuckDB stands in for Redshift, and file-based topics stand in for Kinesis or Kafka (the mapping is in docs/streaming.md). The Redshift DDL is written but has not been run on AWS.
+- **AWS is tested on emulators, not a real account:** the S3 code path and the Terraform are verified against local AWS emulators, and CI validates the Terraform. Nothing has been deployed to a real AWS account, the Glue jobs haven't run on Glue, and the Redshift DDL hasn't run on Redshift. By default everything runs locally: DuckDB stands in for Redshift and file-based topics for Kinesis or Kafka (mapping in docs/streaming.md).
 - **Curated is rebuilt each run** (about 20 s here), while clean and the warehouse are incremental. At larger scale, curate would also process only the changed partitions.
 - **AI:** without an API key the assistant uses deterministic templates, so its language is plain; the Claude path is written and tested against a fake client but not yet run against the live API.
 - **Lead time** is fixed at 10 days for the reorder recommendation, because the inventory feed doesn't carry supplier lead times.
