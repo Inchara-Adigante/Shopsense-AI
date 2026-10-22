@@ -1,7 +1,8 @@
 """
 Run the full stage 1 pipeline end to end:
 
-    generate -> ingest (landing -> raw) -> clean (Spark) -> curate (Spark) -> warehouse load -> backtest
+    generate -> ingest (landing -> raw) -> clean (Spark) -> curate (Spark) -> warehouse load
+             -> review summaries -> backtest
 
 Each step is timed and the run summary is written to lake/_audit/pipeline_run.json.
 Without --skip-generate the lake and warehouse are rebuilt from scratch; with it,
@@ -18,6 +19,7 @@ import shutil
 import time
 from datetime import datetime, timezone
 
+from shopsense.ai import reviews as review_summaries
 from shopsense.config import get_paths
 from shopsense.generate.retail_data import generate
 from shopsense.ingest.land_raw import ingest
@@ -51,6 +53,7 @@ def run(skip_generate: bool = False, days: int | None = None) -> dict:
     finally:
         spark.stop()
     step("load", lambda: {k: v for k, v in load().items() if k in ("run_id", "mode")})
+    step("reviews", lambda: review_summaries.build())
     bt = step("backtest", lambda: backtest.run().round(3).reset_index().to_dict(orient="records"))
 
     summary["finished_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")

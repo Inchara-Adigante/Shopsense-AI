@@ -32,6 +32,11 @@ def query(sql: str, params: tuple = ()) -> pd.DataFrame:
     return connection().execute(sql, list(params)).df()
 
 
+def table_exists(schema: str, table: str) -> bool:
+    return bool(query("SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+                      (schema, table))["n"].iloc[0])
+
+
 as_of = query("SELECT MAX(date) AS d FROM mart.product_fc_daily")["d"].iloc[0]
 st.title("🛒 ShopSense AI: Retail Intelligence")
 st.caption(f"Data as of **{pd.Timestamp(as_of):%b %d, %Y}** · Which products will run out of stock, "
@@ -60,8 +65,8 @@ c3.metric("Session conversion (28d)", f"{conv:.1%}")
 c4.metric("Out of stock now", int(tiers.get("Out of stock", 0)), help="product x fulfillment center")
 c5.metric("High stockout risk", int(tiers.get("High", 0)), help="under 7 days of cover")
 
-tab_live, tab_restock, tab_drivers, tab_sales, tab_health = st.tabs(
-    ["⚡ Live", "📦 Restock this week", "📈 Demand drivers", "💰 Sales & funnel", "🩺 Pipeline health"])
+tab_ask, tab_live, tab_restock, tab_drivers, tab_sales, tab_health = st.tabs(
+    ["🤖 Ask ShopSense", "⚡ Live", "📦 Restock this week", "📈 Demand drivers", "💰 Sales & funnel", "🩺 Pipeline health"])
 
 # ---------------------------------------------------------------- restock
 with tab_restock:
@@ -115,6 +120,11 @@ with tab_drivers:
         st.bar_chart(weekly, x="week", y="units_sold", height=260)
         st.caption("Stockout FC-days per week")
         st.line_chart(weekly, x="week", y="stockout_fc_days", height=160)
+        if table_exists("ai", "review_summaries"):
+            rs = query("SELECT summary, method FROM ai.review_summaries WHERE product_id = ?", (pid,))
+            if len(rs):
+                st.markdown(f"**What customers say** ({rs['method'].iloc[0]} summary)")
+                st.write(rs["summary"].iloc[0])
 
 # ---------------------------------------------------------------- sales
 with tab_sales:
@@ -136,11 +146,6 @@ with tab_sales:
               f"{funnel.hit_out_of_stock / funnel.sessions:.1%} of sessions", delta_color="inverse")
 
 # ---------------------------------------------------------------- pipeline health
-def table_exists(schema: str, table: str) -> bool:
-    return bool(query("SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
-                      (schema, table))["n"].iloc[0])
-
-
 with tab_health:
     st.subheader("Can we trust today's numbers?")
 
@@ -259,3 +264,36 @@ with tab_live:
             h3.metric("Micro-batches", f"{len(prog):,}")
             h4.metric("Dropped as too late", int(prog["rows_dropped_by_watermark"].sum()),
                       help="events more than 10 minutes behind the watermark")
+
+# ---------------------------------------------------------------- ask (AI assistant)
+with tab_ask:
+    from shopsense.ai.assistant import Assistant
+    from shopsense.ai.tools import RetailTools, Warehouse
+
+    st.subheader("Ask a question about stock, demand, sales or reviews")
+    assistant = Assistant(tools=RetailTools(Warehouse(get_paths().warehouse_db)))
+    if assistant.mode == "offline":
+        st.caption("Running in **offline mode**: no Anthropic credentials are configured, so a keyword router "
+                   "picks the tool and fills an answer template. Set `ANTHROPIC_API_KEY` to let Claude answer.")
+    else:
+        st.caption(f"Answers by **Claude** using read-only warehouse tools.")
+    examples = ["Which products need restocking this week in Boston?", "Why is P00121 selling so fast?",
+                "What do customers say about the Auralab Everyday Smart Speaker?", "How were sales in the last 28 days?"]
+    cols = st.columns(len(examples))
+    for col, ex in zip(cols, examples):
+        if col.button(ex, width="stretch"):
+            st.session_state["question"] = ex
+    question = st.text_input("Question", key="question", placeholder=examples[0])
+    if question:
+        answer = assistant.ask(question)
+        st.markdown(answer.text.replace("\n- ", "\n\n- "))
+        g = answer.grounding
+        if g["grounded"]:
+            st.success(f"Grounded: all {g['checked']} numbers come from the cited warehouse rows.")
+        else:
+            st.error(f"Unsupported numbers (not found in any tool result): {', '.join(g['unsupported'])}")
+        if answer.citations:
+            st.markdown("**Sources**")
+            st.dataframe(pd.DataFrame(answer.citations).set_index("ref"), width="stretch")
+        with st.expander("Tool calls"):
+            st.json(answer.tool_calls)
